@@ -16,6 +16,7 @@
     container.mixin.readinessProbe.withInitialDelaySeconds(15) +
     container.mixin.readinessProbe.withTimeoutSeconds(1) +
     $.jaeger_mixin +
+    // sharded queries may need to do a nonzero amount of aggregation on the frontend.
     if $._config.queryFrontend.sharded_queries_enabled then
       $.util.resourcesRequests($._config.queryFrontend.cpuRequests, $._config.queryFrontend.memoryRequests) +
       $.util.resourcesLimits(null, $._config.queryFrontend.memoryLimits) +

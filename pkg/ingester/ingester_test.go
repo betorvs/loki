@@ -20,10 +20,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/util/runtime"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -36,7 +38,7 @@ func TestIngester(t *testing.T) {
 		chunks: map[string][]chunk.Chunk{},
 	}
 
-	i, err := New(ingesterConfig, client.Config{}, store, limits, nil)
+	i, err := New(ingesterConfig, client.Config{}, store, limits, runtime.DefaultTenantConfigs(), nil)
 	require.NoError(t, err)
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
 
@@ -218,7 +220,7 @@ func TestIngesterStreamLimitExceeded(t *testing.T) {
 		chunks: map[string][]chunk.Chunk{},
 	}
 
-	i, err := New(ingesterConfig, client.Config{}, store, overrides, nil)
+	i, err := New(ingesterConfig, client.Config{}, store, overrides, runtime.DefaultTenantConfigs(), nil)
 	require.NoError(t, err)
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
 
@@ -441,6 +443,52 @@ func TestIngester_boltdbShipperMaxLookBack(t *testing.T) {
 			ingester := Ingester{periodicConfigs: tc.periodicConfigs}
 			mlb := ingester.boltdbShipperMaxLookBack()
 			require.InDelta(t, tc.expectedMaxLookBack, mlb, float64(time.Second))
+		})
+	}
+}
+
+func TestValidate(t *testing.T) {
+
+	for i, tc := range []struct {
+		in       Config
+		err      bool
+		expected Config
+	}{
+		{
+			in: Config{
+				MaxChunkAge:   time.Minute,
+				ChunkEncoding: chunkenc.EncGZIP.String(),
+			},
+			expected: Config{
+				MaxChunkAge:    time.Minute,
+				ChunkEncoding:  chunkenc.EncGZIP.String(),
+				parsedEncoding: chunkenc.EncGZIP,
+			},
+		},
+		{
+			in: Config{
+				ChunkEncoding: chunkenc.EncSnappy.String(),
+			},
+			expected: Config{
+				ChunkEncoding:  chunkenc.EncSnappy.String(),
+				parsedEncoding: chunkenc.EncSnappy,
+			},
+		},
+		{
+			in: Config{
+				ChunkEncoding: "bad-enc",
+			},
+			err: true,
+		},
+	} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			err := tc.in.Validate()
+			if tc.err {
+				require.NotNil(t, err)
+				return
+			}
+			require.Nil(t, err)
+			require.Equal(t, tc.expected, tc.in)
 		})
 	}
 }

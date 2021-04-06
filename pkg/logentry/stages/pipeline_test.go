@@ -1,10 +1,12 @@
 package stages
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,6 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
+
+	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/promtail/api"
+	"github.com/grafana/loki/pkg/promtail/client/fake"
 )
 
 var (
@@ -38,6 +44,9 @@ pipeline_stages:
         action:
         service:
         status_code: "status"
+- match:
+    selector: "{match=\"false\"}"
+    action: drop
 `
 
 var testLabelsFromJSONYaml = `
@@ -52,6 +61,24 @@ pipeline_stages:
     source: message
 `
 
+func withInboundEntries(entries ...Entry) chan Entry {
+	in := make(chan Entry, len(entries))
+	defer close(in)
+	for _, e := range entries {
+		in <- e
+	}
+	return in
+}
+
+func processEntries(s Stage, entries ...Entry) []Entry {
+	out := s.Run(withInboundEntries(entries...))
+	var res []Entry
+	for e := range out {
+		res = append(res, e)
+	}
+	return res
+}
+
 func loadConfig(yml string) PipelineStages {
 	var config map[string]interface{}
 	err := yaml.Unmarshal([]byte(yml), &config)
@@ -62,12 +89,11 @@ func loadConfig(yml string) PipelineStages {
 }
 
 func TestNewPipeline(t *testing.T) {
-
-	p, err := NewPipeline(util.Logger, loadConfig(testMultiStageYaml), nil, prometheus.DefaultRegisterer)
+	p, err := NewPipeline(util_log.Logger, loadConfig(testMultiStageYaml), nil, prometheus.DefaultRegisterer)
 	if err != nil {
 		panic(err)
 	}
-	require.Equal(t, 1, len(p.stages))
+	require.Len(t, p.stages, 2)
 }
 
 func TestPipeline_Process(t *testing.T) {
@@ -175,15 +201,14 @@ func TestPipeline_Process(t *testing.T) {
 			err := yaml.Unmarshal([]byte(tt.config), &config)
 			require.NoError(t, err)
 
-			p, err := NewPipeline(util.Logger, config["pipeline_stages"].([]interface{}), nil, prometheus.DefaultRegisterer)
+			p, err := NewPipeline(util_log.Logger, config["pipeline_stages"].([]interface{}), nil, prometheus.DefaultRegisterer)
 			require.NoError(t, err)
 
-			extracted := map[string]interface{}{}
-			p.Process(tt.initialLabels, extracted, &tt.t, &tt.entry)
+			out := processEntries(p, newEntry(nil, tt.initialLabels, tt.entry, tt.t))[0]
 
-			assert.Equal(t, tt.expectedLabels, tt.initialLabels, "did not get expected labels")
-			assert.Equal(t, tt.expectedEntry, tt.entry, "did not receive expected log entry")
-			if tt.t.Unix() != tt.expectedT.Unix() {
+			assert.Equal(t, tt.expectedLabels, out.Labels, "did not get expected labels")
+			assert.Equal(t, tt.expectedEntry, out.Line, "did not receive expected log entry")
+			if out.Timestamp.Unix() != tt.expectedT.Unix() {
 				t.Fatalf("mismatch ts want: %s got:%s", tt.expectedT, tt.t)
 			}
 		})
@@ -224,22 +249,21 @@ func BenchmarkPipeline(b *testing.B) {
 			}
 			lb := model.LabelSet{}
 			ts := time.Now()
+
+			in := make(chan Entry)
+			out := pl.Run(in)
+			b.ResetTimer()
+
+			go func() {
+				for range out {
+				}
+			}()
 			for i := 0; i < b.N; i++ {
-				entry := bm.entry
-				extracted := map[string]interface{}{}
-				pl.Process(lb, extracted, &ts, &entry)
+				in <- newEntry(nil, lb, bm.entry, ts)
 			}
+			close(in)
 		})
 	}
-}
-
-type stubHandler struct {
-	bool
-}
-
-func (s *stubHandler) Handle(labels model.LabelSet, time time.Time, entry string) error {
-	s.bool = true
-	return nil
 }
 
 func TestPipeline_Wrap(t *testing.T) {
@@ -249,7 +273,7 @@ func TestPipeline_Wrap(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	p, err := NewPipeline(util.Logger, config["pipeline_stages"].([]interface{}), nil, prometheus.DefaultRegisterer)
+	p, err := NewPipeline(util_log.Logger, config["pipeline_stages"].([]interface{}), nil, prometheus.DefaultRegisterer)
 	if err != nil {
 		panic(err)
 	}
@@ -260,10 +284,10 @@ func TestPipeline_Wrap(t *testing.T) {
 	}{
 		"should drop": {
 			map[model.LabelName]model.LabelValue{
-				dropLabel:     "true",
 				"stream":      "stderr",
 				"action":      "GET",
 				"status_code": "200",
+				"match":       "false",
 			},
 			false,
 		},
@@ -281,15 +305,107 @@ func TestPipeline_Wrap(t *testing.T) {
 		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
-			extracted := map[string]interface{}{}
-			p.Process(tt.labels, extracted, &now, &rawTestLine)
-			stub := &stubHandler{}
-			handler := p.Wrap(stub)
-			if err := handler.Handle(tt.labels, now, rawTestLine); err != nil {
-				t.Fatalf("failed to handle entry: %v", err)
-			}
-			assert.Equal(t, stub.bool, tt.shouldSend)
+			c := fake.New(func() {})
+			handler := p.Wrap(c)
 
+			handler.Chan() <- api.Entry{
+				Labels: tt.labels,
+				Entry: logproto.Entry{
+					Line:      rawTestLine,
+					Timestamp: now,
+				},
+			}
+			handler.Stop()
+			c.Stop()
+			var received bool
+
+			if len(c.Received()) != 0 {
+				received = true
+			}
+
+			assert.Equal(t, tt.shouldSend, received)
 		})
 	}
+}
+
+func newPipelineFromConfig(cfg, name string) (*Pipeline, error) {
+	var config map[string]interface{}
+
+	err := yaml.Unmarshal([]byte(cfg), &config)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewPipeline(util_log.Logger, config["pipeline_stages"].([]interface{}), &name, prometheus.DefaultRegisterer)
+}
+
+func Test_PipelineParallel(t *testing.T) {
+	c := fake.New(func() {})
+	cfg := `
+pipeline_stages:
+- match:
+    selector: "{match=~\".*\"}"
+    stages:
+    - multiline:
+        firstline: '^{'
+        max_wait_time: 3s
+        max_lines: 2
+    - json:
+        expressions:
+          app:
+          message:
+    - labels:
+        app:
+    - output:
+        source: message
+- match:
+    selector: "{match=~\".*\"}"
+    stages:
+    - json:
+        expressions:
+          app:
+          message:
+    - labels:
+        app:
+    - output:
+        source: message
+`
+	p, err := newPipelineFromConfig(cfg, "test")
+	require.NoError(t, err)
+
+	e1 := p.Wrap(c)
+	e2 := api.AddLabelsMiddleware(model.LabelSet{"bar": "foo"}).Wrap(e1)
+	entryhandler := api.AddLabelsMiddleware(model.LabelSet{"foo": "bar"}).Wrap(e2)
+
+	var wg sync.WaitGroup
+	parallelism := 10
+	wg.Add(parallelism)
+
+	for i := 0; i < parallelism; i++ {
+		go func(i int) {
+			defer wg.Done()
+			entryhandler.Chan() <- api.Entry{
+				Labels: make(model.LabelSet),
+				Entry: logproto.Entry{
+					Timestamp: time.Now(),
+					Line:      fmt.Sprintf(`{app:"%d", `, 5),
+				},
+			}
+			entryhandler.Chan() <- api.Entry{
+				Labels: make(model.LabelSet),
+				Entry: logproto.Entry{
+					Timestamp: time.Now(),
+					Line:      fmt.Sprintf(` message:"%s"}`, time.Now()),
+				},
+			}
+			t.Log(i)
+		}(i)
+	}
+
+	wg.Wait()
+	entryhandler.Stop()
+	e2.Stop()
+	e1.Stop()
+	c.Stop()
+	t.Log(c.Received())
 }

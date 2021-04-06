@@ -6,45 +6,34 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
 	"github.com/grafana/loki/pkg/logentry/stages"
+	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/promtail/api"
+	"github.com/grafana/loki/pkg/promtail/client/fake"
 	"github.com/grafana/loki/pkg/promtail/scrapeconfig"
 )
-
-type line struct {
-	labels model.LabelSet
-	entry  string
-}
-
-type clientRecorder struct {
-	recorded []line
-}
-
-func (c *clientRecorder) Handle(labels model.LabelSet, time time.Time, entry string) error {
-	c.recorded = append(c.recorded, line{labels: labels, entry: entry})
-	return nil
-}
 
 func Test_newReaderTarget(t *testing.T) {
 	tests := []struct {
 		name    string
 		in      io.Reader
 		cfg     scrapeconfig.Config
-		want    []line
+		want    []api.Entry
 		wantErr bool
 	}{
 		{
 			"no newlines",
 			bytes.NewReader([]byte("bar")),
 			scrapeconfig.Config{},
-			[]line{
-				{model.LabelSet{}, "bar"},
+			[]api.Entry{
+				{Labels: model.LabelSet{}, Entry: logproto.Entry{Line: "bar"}},
 			},
 			false,
 		},
@@ -59,9 +48,9 @@ func Test_newReaderTarget(t *testing.T) {
 			"newlines",
 			bytes.NewReader([]byte("\nfoo\r\nbar")),
 			scrapeconfig.Config{},
-			[]line{
-				{model.LabelSet{}, "foo"},
-				{model.LabelSet{}, "bar"},
+			[]api.Entry{
+				{Labels: model.LabelSet{}, Entry: logproto.Entry{Line: "foo"}},
+				{Labels: model.LabelSet{}, Entry: logproto.Entry{Line: "bar"}},
 			},
 			false,
 		},
@@ -71,9 +60,9 @@ func Test_newReaderTarget(t *testing.T) {
 			scrapeconfig.Config{
 				PipelineStages: loadConfig(stagesConfig),
 			},
-			[]line{
-				{model.LabelSet{"new_key": "hello world!"}, "foo"},
-				{model.LabelSet{"new_key": "hello world!"}, "bar"},
+			[]api.Entry{
+				{Labels: model.LabelSet{"new_key": "hello world!"}, Entry: logproto.Entry{Line: "foo"}},
+				{Labels: model.LabelSet{"new_key": "hello world!"}, Entry: logproto.Entry{Line: "bar"}},
 			},
 			false,
 		},
@@ -81,17 +70,17 @@ func Test_newReaderTarget(t *testing.T) {
 			"default config",
 			bytes.NewReader([]byte("\nfoo\r\nbar")),
 			defaultStdInCfg,
-			[]line{
-				{model.LabelSet{"job": "stdin", "hostname": model.LabelValue(hostName)}, "foo"},
-				{model.LabelSet{"job": "stdin", "hostname": model.LabelValue(hostName)}, "bar"},
+			[]api.Entry{
+				{Labels: model.LabelSet{"job": "stdin", "hostname": model.LabelValue(hostName)}, Entry: logproto.Entry{Line: "foo"}},
+				{Labels: model.LabelSet{"job": "stdin", "hostname": model.LabelValue(hostName)}, Entry: logproto.Entry{Line: "bar"}},
 			},
 			false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			recorder := &clientRecorder{}
-			got, err := newReaderTarget(util.Logger, tt.in, recorder, tt.cfg)
+			c := fake.New(func() {})
+			got, err := newReaderTarget(prometheus.DefaultRegisterer, util_log.Logger, tt.in, c, tt.cfg)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("newReaderTarget() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -100,7 +89,8 @@ func Test_newReaderTarget(t *testing.T) {
 				return
 			}
 			<-got.ctx.Done()
-			require.Equal(t, tt.want, recorder.recorded)
+			c.Stop()
+			compareEntries(t, tt.want, c.Received())
 		})
 	}
 }
@@ -118,7 +108,7 @@ type fakeStdin struct {
 	os.FileInfo
 }
 
-func newFakeStin(data string) *fakeStdin {
+func newFakeStdin(data string) *fakeStdin {
 	return &fakeStdin{
 		Reader: strings.NewReader(data),
 	}
@@ -127,26 +117,35 @@ func newFakeStin(data string) *fakeStdin {
 func (f fakeStdin) Stat() (os.FileInfo, error) { return f.FileInfo, nil }
 
 func Test_Shutdown(t *testing.T) {
-	stdIn = newFakeStin("line")
+	stdIn = newFakeStdin("line")
 	appMock := &mockShutdownable{called: make(chan bool, 1)}
-	recorder := &clientRecorder{}
-	manager, err := NewStdinTargetManager(util.Logger, appMock, recorder, []scrapeconfig.Config{{}})
+	recorder := fake.New(func() {})
+	manager, err := NewStdinTargetManager(prometheus.DefaultRegisterer, util_log.Logger, appMock, recorder, []scrapeconfig.Config{{}})
 	require.NoError(t, err)
 	require.NotNil(t, manager)
-	called := <-appMock.called
-	require.Equal(t, true, called)
-	require.Equal(t, []line{{labels: model.LabelSet{}, entry: "line"}}, recorder.recorded)
+	require.Equal(t, true, <-appMock.called)
+	recorder.Stop()
+	compareEntries(t, []api.Entry{{Labels: model.LabelSet{}, Entry: logproto.Entry{Line: "line"}}}, recorder.Received())
+}
+
+func compareEntries(t *testing.T, expected, actual []api.Entry) {
+	t.Helper()
+	require.Equal(t, len(expected), len(actual))
+	for i := range expected {
+		require.Equal(t, expected[i].Entry.Line, actual[i].Entry.Line)
+		require.Equal(t, expected[i].Labels, actual[i].Labels)
+	}
 }
 
 func Test_StdinConfigs(t *testing.T) {
 
 	// should take the first config
-	require.Equal(t, scrapeconfig.DefaultScrapeConfig, getStdinConfig(util.Logger, []scrapeconfig.Config{
+	require.Equal(t, scrapeconfig.DefaultScrapeConfig, getStdinConfig(util_log.Logger, []scrapeconfig.Config{
 		scrapeconfig.DefaultScrapeConfig,
 		{},
 	}))
 	// or use the default if none if provided
-	require.Equal(t, defaultStdInCfg, getStdinConfig(util.Logger, []scrapeconfig.Config{}))
+	require.Equal(t, defaultStdInCfg, getStdinConfig(util_log.Logger, []scrapeconfig.Config{}))
 }
 
 var stagesConfig = `

@@ -3,11 +3,11 @@ package logql
 import (
 	"testing"
 
-	"github.com/grafana/loki/pkg/logql/log"
-
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/loki/pkg/logql/log"
 )
 
 func Test_logSelectorExpr_String(t *testing.T) {
@@ -16,7 +16,7 @@ func Test_logSelectorExpr_String(t *testing.T) {
 		selector     string
 		expectFilter bool
 	}{
-		{`{foo!~"bar"}`, false},
+		{`{foo="bar"}`, false},
 		{`{foo="bar", bar!="baz"}`, false},
 		{`{foo="bar", bar!="baz"} != "bip" !~ ".+bop"`, true},
 		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap"`, true},
@@ -27,6 +27,8 @@ func Test_logSelectorExpr_String(t *testing.T) {
 		{`{foo="bar", bar!="baz"} |~ "" |= "" |~ ".*"`, false},
 		{`{foo="bar", bar!="baz"} != "bip" !~ ".+bop" | json`, true},
 		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap" | logfmt`, true},
+		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap" | unpack | foo>5`, true},
+		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap" | logfmt | b>=10GB`, true},
 		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap" | regexp "(?P<foo>foo|bar)"`, true},
 		{`{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap" | regexp "(?P<foo>foo|bar)" | ( ( foo<5.01 , bar>20ms ) or foo="bar" ) | line_format "blip{{.boop}}bap" | label_format foo=bar,bar="blip{{.blop}}"`, true},
 	}
@@ -35,7 +37,7 @@ func Test_logSelectorExpr_String(t *testing.T) {
 		tt := tt
 		t.Run(tt.selector, func(t *testing.T) {
 			t.Parallel()
-			expr, err := ParseLogSelector(tt.selector)
+			expr, err := ParseLogSelector(tt.selector, true)
 			if err != nil {
 				t.Fatalf("failed to parse log selector: %s", err)
 			}
@@ -43,7 +45,9 @@ func Test_logSelectorExpr_String(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to get filter: %s", err)
 			}
-			require.Equal(t, tt.expectFilter, p != log.NoopPipeline)
+			if !tt.expectFilter {
+				require.Equal(t, log.NewNoopPipeline(), p)
+			}
 			if expr.String() != tt.selector {
 				t.Fatalf("error expected: %s got: %s", tt.selector, expr.String())
 			}
@@ -55,17 +59,28 @@ func Test_SampleExpr_String(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []string{
 		`rate( ( {job="mysql"} |="error" !="timeout" ) [10s] )`,
+		`absent_over_time( ( {job="mysql"} |="error" !="timeout" ) [10s] )`,
+		`absent_over_time( ( {job="mysql"} |="error" !="timeout" ) [10s] offset 10m )`,
 		`sum without(a) ( rate ( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )`,
 		`sum by(a) (rate( ( {job="mysql"} |="error" !="timeout" ) [10s] ) )`,
 		`sum(count_over_time({job="mysql"}[5m]))`,
+		`sum(count_over_time({job="mysql"}[5m] offset 10m))`,
 		`sum(count_over_time({job="mysql"} | json [5m]))`,
+		`sum(count_over_time({job="mysql"} | json [5m] offset 10m))`,
 		`sum(count_over_time({job="mysql"} | logfmt [5m]))`,
+		`sum(count_over_time({job="mysql"} | logfmt [5m] offset 10m))`,
+		`sum(count_over_time({job="mysql"} | unpack | json [5m]))`,
 		`sum(count_over_time({job="mysql"} | regexp "(?P<foo>foo|bar)" [5m]))`,
+		`sum(count_over_time({job="mysql"} | regexp "(?P<foo>foo|bar)" [5m] offset 10m))`,
 		`topk(10,sum(rate({region="us-east1"}[5m])) by (name))`,
+		`topk by (name)(10,sum(rate({region="us-east1"}[5m])))`,
 		`avg( rate( ( {job="nginx"} |= "GET" ) [10s] ) ) by (region)`,
 		`avg(min_over_time({job="nginx"} |= "GET" | unwrap foo[10s])) by (region)`,
+		`avg(min_over_time({job="nginx"} |= "GET" | unwrap foo[10s] offset 10m)) by (region)`,
 		`sum by (cluster) (count_over_time({job="mysql"}[5m]))`,
+		`sum by (cluster) (count_over_time({job="mysql"}[5m] offset 10m))`,
 		`sum by (cluster) (count_over_time({job="mysql"}[5m])) / sum by (cluster) (count_over_time({job="postgres"}[5m])) `,
+		`sum by (cluster) (count_over_time({job="mysql"}[5m] offset 10m)) / sum by (cluster) (count_over_time({job="postgres"}[5m] offset 10m)) `,
 		`
 		sum by (cluster) (count_over_time({job="postgres"}[5m])) /
 		sum by (cluster) (count_over_time({job="postgres"}[5m])) /
@@ -79,9 +94,16 @@ func Test_SampleExpr_String(t *testing.T) {
 		)`,
 		`stdvar_over_time({app="foo"} |= "bar" | json | latency >= 250ms or ( status_code < 500 and status_code > 200)
 		| line_format "blip{{ .foo }}blop {{.status_code}}" | label_format foo=bar,status_code="buzz{{.bar}}" | unwrap foo [5m])`,
+		`stdvar_over_time({app="foo"} |= "bar" | json | latency >= 250ms or ( status_code < 500 and status_code > 200)
+		| line_format "blip{{ .foo }}blop {{.status_code}}" | label_format foo=bar,status_code="buzz{{.bar}}" | unwrap foo [5m] offset 10m)`,
 		`sum_over_time({namespace="tns"} |= "level=error" | json |foo>=5,bar<25ms|unwrap latency [5m])`,
 		`sum by (job) (
 			sum_over_time({namespace="tns"} |= "level=error" | json | foo=5 and bar<25ms | unwrap latency[5m])
+		/
+			count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m])
+		)`,
+		`sum by (job) (
+			sum_over_time({namespace="tns"} |= "level=error" | json | foo=5 and bar<25ms | unwrap bytes(latency)[5m])
 		/
 			count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m])
 		)`,
@@ -93,6 +115,9 @@ func Test_SampleExpr_String(t *testing.T) {
 			count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m])
 		)`,
 		`sum_over_time({namespace="tns"} |= "level=error" | json |foo>=5,bar<25ms | unwrap latency | __error__!~".*" | foo >5[5m])`,
+		`last_over_time({namespace="tns"} |= "level=error" | json |foo>=5,bar<25ms | unwrap latency | __error__!~".*" | foo >5[5m])`,
+		`first_over_time({namespace="tns"} |= "level=error" | json |foo>=5,bar<25ms | unwrap latency | __error__!~".*" | foo >5[5m])`,
+		`absent_over_time({namespace="tns"} |= "level=error" | json |foo>=5,bar<25ms | unwrap latency | __error__!~".*" | foo >5[5m])`,
 		`sum by (job) (
 			sum_over_time(
 				{namespace="tns"} |= "level=error" | json | avg=5 and bar<25ms | unwrap duration(latency)  | __error__!~".*" [5m]
@@ -100,6 +125,37 @@ func Test_SampleExpr_String(t *testing.T) {
 		/
 			count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m])
 		)`,
+		`label_replace(
+			sum by (job) (
+				sum_over_time(
+					{namespace="tns"} |= "level=error" | json | avg=5 and bar<25ms | unwrap duration(latency)  | __error__!~".*" [5m]
+				)
+			/
+				count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m])
+			),
+			"foo",
+			"$1",
+			"service",
+			"(.*):.*"
+		)
+		`,
+		`10 / (5/2)`,
+		`10 / (count_over_time({job="postgres"}[5m])/2)`,
+		`{app="foo"} | json response_status="response.status.code", first_param="request.params[0]"`,
+		`label_replace(
+			sum by (job) (
+				sum_over_time(
+					{namespace="tns"} |= "level=error" | json | avg=5 and bar<25ms | unwrap duration(latency)  | __error__!~".*" [5m] offset 1h
+				)
+			/
+				count_over_time({namespace="tns"} | logfmt | label_format foo=bar[5m] offset 1h)
+			),
+			"foo",
+			"$1",
+			"service",
+			"(.*):.*"
+		)
+		`,
 	} {
 		t.Run(tc, func(t *testing.T) {
 			expr, err := ParseExpr(tc)
@@ -122,17 +178,16 @@ func Test_NilFilterDoesntPanic(t *testing.T) {
 		`{namespace="dev", container_name="cart"} |= "bleep" |= "bloop" |= ""`,
 	} {
 		t.Run(tc, func(t *testing.T) {
-			expr, err := ParseLogSelector(tc)
+			expr, err := ParseLogSelector(tc, true)
 			require.Nil(t, err)
 
 			p, err := expr.Pipeline()
 			require.Nil(t, err)
-			_, _, ok := p.Process([]byte("bleepbloop"), labelBar)
+			_, _, ok := p.ForStream(labelBar).Process([]byte("bleepbloop"))
 
 			require.True(t, ok)
 		})
 	}
-
 }
 
 type linecheck struct {
@@ -201,21 +256,29 @@ func Test_FilterMatcher(t *testing.T) {
 			},
 			[]linecheck{{"foo", true}, {"bar", false}, {"foobar", true}},
 		},
+		{
+			`{app="foo"} | logfmt | duration > 1s and total_bytes < 1GB`,
+			[]*labels.Matcher{
+				mustNewMatcher(labels.MatchEqual, "app", "foo"),
+			},
+			[]linecheck{{"duration=5m total_bytes=5kB", true}, {"duration=1s total_bytes=256B", false}, {"duration=0s", false}},
+		},
 	} {
 		tt := tt
 		t.Run(tt.q, func(t *testing.T) {
 			t.Parallel()
-			expr, err := ParseLogSelector(tt.q)
+			expr, err := ParseLogSelector(tt.q, true)
 			assert.Nil(t, err)
 			assert.Equal(t, tt.expectedMatchers, expr.Matchers())
 			p, err := expr.Pipeline()
 			assert.Nil(t, err)
 			if tt.lines == nil {
-				assert.Equal(t, p, log.NoopPipeline)
+				assert.Equal(t, p, log.NewNoopPipeline())
 			} else {
+				sp := p.ForStream(labelBar)
 				for _, lc := range tt.lines {
-					_, _, ok := p.Process([]byte(lc.l), labelBar)
-					assert.Equal(t, lc.e, ok)
+					_, _, ok := sp.Process([]byte(lc.l))
+					assert.Equalf(t, lc.e, ok, "query for line '%s' was %v and not %v", lc.l, ok, lc.e)
 				}
 			}
 		})
@@ -241,16 +304,16 @@ func TestStringer(t *testing.T) {
 		},
 		{
 			in:  `1 > bool 1 > count_over_time({foo="bar"}[1m])`,
-			out: `0 > count_over_time({foo="bar"}[1m])`,
+			out: `(0 > count_over_time({foo="bar"}[1m]))`,
 		},
 		{
 			in:  `1 > bool 1 > bool count_over_time({foo="bar"}[1m])`,
-			out: `0 > bool count_over_time({foo="bar"}[1m])`,
+			out: `(0 > bool count_over_time({foo="bar"}[1m]))`,
 		},
 		{
 
 			in:  `0 > count_over_time({foo="bar"}[1m])`,
-			out: `0 > count_over_time({foo="bar"}[1m])`,
+			out: `(0 > count_over_time({foo="bar"}[1m]))`,
 		},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
@@ -262,7 +325,7 @@ func TestStringer(t *testing.T) {
 }
 
 func BenchmarkContainsFilter(b *testing.B) {
-	expr, err := ParseLogSelector(`{app="foo"} |= "foo"`)
+	expr, err := ParseLogSelector(`{app="foo"} |= "foo"`, true)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -276,8 +339,9 @@ func BenchmarkContainsFilter(b *testing.B) {
 
 	b.ResetTimer()
 
+	sp := p.ForStream(labelBar)
 	for i := 0; i < b.N; i++ {
-		if _, _, ok := p.Process(line, labelBar); !ok {
+		if _, _, ok := sp.Process(line); !ok {
 			b.Fatal("doesn't match")
 		}
 	}
@@ -292,6 +356,7 @@ func Test_parserExpr_Parser(t *testing.T) {
 		wantErr bool
 	}{
 		{"json", OpParserTypeJSON, "", log.NewJSONParser(), false},
+		{"unpack", OpParserTypeUnpack, "", log.NewUnpackParser(), false},
 		{"logfmt", OpParserTypeLogfmt, "", log.NewLogfmtParser(), false},
 		{"regexp", OpParserTypeRegexp, "(?P<foo>foo)", mustNewRegexParser("(?P<foo>foo)"), false},
 		{"regexp err ", OpParserTypeRegexp, "foo", nil, true},
@@ -322,4 +387,40 @@ func mustNewRegexParser(re string) log.Stage {
 		panic(err)
 	}
 	return r
+}
+
+func Test_canInjectVectorGrouping(t *testing.T) {
+	tests := []struct {
+		vecOp   string
+		rangeOp string
+		want    bool
+	}{
+		{OpTypeSum, OpRangeTypeBytes, true},
+		{OpTypeSum, OpRangeTypeBytesRate, true},
+		{OpTypeSum, OpRangeTypeSum, true},
+		{OpTypeSum, OpRangeTypeRate, true},
+		{OpTypeSum, OpRangeTypeCount, true},
+
+		{OpTypeSum, OpRangeTypeAvg, false},
+		{OpTypeSum, OpRangeTypeMax, false},
+		{OpTypeSum, OpRangeTypeQuantile, false},
+		{OpTypeSum, OpRangeTypeStddev, false},
+		{OpTypeSum, OpRangeTypeStdvar, false},
+		{OpTypeSum, OpRangeTypeMin, false},
+		{OpTypeSum, OpRangeTypeMax, false},
+
+		{OpTypeAvg, OpRangeTypeBytes, false},
+		{OpTypeCount, OpRangeTypeBytesRate, false},
+		{OpTypeBottomK, OpRangeTypeSum, false},
+		{OpTypeMax, OpRangeTypeRate, false},
+		{OpTypeMin, OpRangeTypeCount, false},
+		{OpTypeTopK, OpRangeTypeCount, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.vecOp+"_"+tt.rangeOp, func(t *testing.T) {
+			if got := canInjectVectorGrouping(tt.vecOp, tt.rangeOp); got != tt.want {
+				t.Errorf("canInjectVectorGrouping() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

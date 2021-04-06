@@ -3,6 +3,7 @@ package distributor
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
 	fe "github.com/grafana/loki/pkg/util/flagext"
+	"github.com/grafana/loki/pkg/util/runtime"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -58,19 +60,19 @@ func TestDistributor(t *testing.T) {
 		},
 		{
 			lines:         100,
-			expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(100, 100, 1000)),
+			expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 100, 100, 1000),
 		},
 		{
 			lines:            100,
 			maxLineSize:      1,
 			expectedResponse: success,
-			expectedError:    httpgrpc.Errorf(http.StatusBadRequest, validation.LineTooLongErrorMsg(1, 10, "{foo=\"bar\"}")),
+			expectedError:    httpgrpc.Errorf(http.StatusBadRequest, validation.LineTooLongErrorMsg, 1, "{foo=\"bar\"}", 10),
 		},
 		{
 			lines:            100,
 			mangleLabels:     true,
 			expectedResponse: success,
-			expectedError:    httpgrpc.Errorf(http.StatusBadRequest, "error parsing labels: parse error at line 1, col 4: literal not terminated"),
+			expectedError:    httpgrpc.Errorf(http.StatusBadRequest, validation.InvalidLabelsErrorMsg, "{ab\"", "1:4: parse error: unterminated quoted string"),
 		},
 	} {
 		t.Run(fmt.Sprintf("[%d](samples=%v)", i, tc.lines), func(t *testing.T) {
@@ -81,7 +83,7 @@ func TestDistributor(t *testing.T) {
 			limits.IngestionBurstSizeMB = ingestionRateLimit
 			limits.MaxLineSize = fe.ByteSize(tc.maxLineSize)
 
-			d := prepare(t, limits, nil)
+			d := prepare(t, limits, nil, nil)
 			defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
 
 			request := makeWriteRequest(tc.lines, 10)
@@ -94,6 +96,68 @@ func TestDistributor(t *testing.T) {
 			assert.Equal(t, tc.expectedResponse, response)
 			assert.Equal(t, tc.expectedError, err)
 		})
+	}
+}
+
+func Test_SortLabelsOnPush(t *testing.T) {
+	limits := &validation.Limits{}
+	flagext.DefaultValues(limits)
+	limits.EnforceMetricName = false
+	ingester := &mockIngester{}
+	d := prepare(t, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+	defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+
+	request := makeWriteRequest(10, 10)
+	request.Streams[0].Labels = `{buzz="f", a="b"}`
+	_, err := d.Push(ctx, request)
+	require.NoError(t, err)
+	require.Equal(t, `{a="b", buzz="f"}`, ingester.pushed[0].Streams[0].Labels)
+}
+
+func Benchmark_SortLabelsOnPush(b *testing.B) {
+	limits := &validation.Limits{}
+	flagext.DefaultValues(limits)
+	limits.EnforceMetricName = false
+	ingester := &mockIngester{}
+	d := prepare(&testing.T{}, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+	defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+	request := makeWriteRequest(10, 10)
+	vCtx := d.validator.getValidationContextFor("123")
+	for n := 0; n < b.N; n++ {
+		stream := request.Streams[0]
+		stream.Labels = `{buzz="f", a="b"}`
+		_, err := d.parseStreamLabels(vCtx, stream.Labels, &stream)
+		if err != nil {
+			panic("parseStreamLabels fail,err:" + err.Error())
+		}
+	}
+}
+
+func Benchmark_Push(b *testing.B) {
+	limits := &validation.Limits{}
+	flagext.DefaultValues(limits)
+	limits.IngestionBurstSizeMB = math.MaxInt32
+	limits.CardinalityLimit = math.MaxInt32
+	limits.IngestionRateMB = math.MaxInt32
+	limits.EnforceMetricName = false
+	limits.MaxLineSize = math.MaxInt32
+	limits.RejectOldSamples = true
+	limits.RejectOldSamplesMaxAge = 24 * time.Hour
+	limits.CreationGracePeriod = 24 * time.Hour
+	ingester := &mockIngester{}
+	d := prepare(&testing.T{}, limits, nil, func(addr string) (ring_client.PoolClient, error) { return ingester, nil })
+	defer services.StopAndAwaitTerminated(context.Background(), d) //nolint:errcheck
+	request := makeWriteRequest(100000, 100)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for n := 0; n < b.N; n++ {
+
+		_, err := d.Push(ctx, request)
+		if err != nil {
+			require.NoError(b, err)
+		}
 	}
 }
 
@@ -117,9 +181,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  10 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 5, expectedError: nil},
-				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(10, 1, 6))},
+				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 10, 1, 6)},
 				{bytes: 5, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(10, 1, 1))},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 10, 1, 1)},
 			},
 		},
 		"global strategy: limit should be evenly shared across distributors": {
@@ -129,9 +193,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  5 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 3, expectedError: nil},
-				{bytes: 3, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(5, 1, 3))},
+				{bytes: 3, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 3)},
 				{bytes: 2, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(5, 1, 1))},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 1)},
 			},
 		},
 		"global strategy: burst should set to each distributor": {
@@ -141,9 +205,9 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			ingestionBurstSizeMB:  20 * (1.0 / float64(bytesInMB)),
 			pushes: []testPush{
 				{bytes: 15, expectedError: nil},
-				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(5, 1, 6))},
+				{bytes: 6, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 6)},
 				{bytes: 5, expectedError: nil},
-				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(5, 1, 1))},
+				{bytes: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, 5, 1, 1)},
 			},
 		},
 	}
@@ -165,7 +229,7 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			// Start all expected distributors
 			distributors := make([]*Distributor, testData.distributors)
 			for i := 0; i < testData.distributors; i++ {
-				distributors[i] = prepare(t, limits, kvStore)
+				distributors[i] = prepare(t, limits, kvStore, nil)
 				defer services.StopAndAwaitTerminated(context.Background(), distributors[i]) //nolint:errcheck
 			}
 
@@ -211,7 +275,7 @@ func loopbackInterfaceName() (string, error) {
 	return "", fmt.Errorf("can't retrieve loopback interface name")
 }
 
-func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client) *Distributor {
+func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client, factory func(addr string) (ring_client.PoolClient, error)) *Distributor {
 	var (
 		distributorConfig Config
 		clientConfig      client.Config
@@ -231,7 +295,7 @@ func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client) *Distri
 		replicationFactor: 3,
 	}
 	for addr := range ingesters {
-		ingestersRing.ingesters = append(ingestersRing.ingesters, ring.IngesterDesc{
+		ingestersRing.ingesters = append(ingestersRing.ingesters, ring.InstanceDesc{
 			Addr: addr,
 		})
 	}
@@ -243,11 +307,14 @@ func prepare(t *testing.T, limits *validation.Limits, kvStore kv.Client) *Distri
 	distributorConfig.DistributorRing.InstanceID = strconv.Itoa(rand.Int())
 	distributorConfig.DistributorRing.KVStore.Mock = kvStore
 	distributorConfig.DistributorRing.InstanceInterfaceNames = []string{loopbackName}
-	distributorConfig.factory = func(addr string) (ring_client.PoolClient, error) {
-		return ingesters[addr], nil
+	distributorConfig.factory = factory
+	if factory == nil {
+		distributorConfig.factory = func(addr string) (ring_client.PoolClient, error) {
+			return ingesters[addr], nil
+		}
 	}
 
-	d, err := New(distributorConfig, clientConfig, ingestersRing, overrides, nil)
+	d, err := New(distributorConfig, clientConfig, runtime.DefaultTenantConfigs(), ingestersRing, overrides, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), d))
 
@@ -269,7 +336,7 @@ func makeWriteRequest(lines int, size int) *logproto.PushRequest {
 		line = line[:size]
 
 		req.Streams[0].Entries = append(req.Streams[0].Entries, logproto.Entry{
-			Timestamp: time.Unix(0, 0),
+			Timestamp: time.Now().Add(time.Duration(i) * time.Millisecond),
 			Line:      line,
 		})
 	}
@@ -279,9 +346,12 @@ func makeWriteRequest(lines int, size int) *logproto.PushRequest {
 type mockIngester struct {
 	grpc_health_v1.HealthClient
 	logproto.PusherClient
+
+	pushed []*logproto.PushRequest
 }
 
 func (i *mockIngester) Push(ctx context.Context, in *logproto.PushRequest, opts ...grpc.CallOption) (*logproto.PushResponse, error) {
+	i.pushed = append(i.pushed, in)
 	return nil, nil
 }
 
@@ -294,25 +364,29 @@ func (i *mockIngester) Close() error {
 // ingesters.
 type mockRing struct {
 	prometheus.Counter
-	ingesters         []ring.IngesterDesc
+	ingesters         []ring.InstanceDesc
 	replicationFactor uint32
 }
 
-func (r mockRing) Get(key uint32, op ring.Operation, buf []ring.IngesterDesc) (ring.ReplicationSet, error) {
+func (r mockRing) Get(key uint32, op ring.Operation, buf []ring.InstanceDesc, _ []string, _ []string) (ring.ReplicationSet, error) {
 	result := ring.ReplicationSet{
 		MaxErrors: 1,
-		Ingesters: buf[:0],
+		Instances: buf[:0],
 	}
 	for i := uint32(0); i < r.replicationFactor; i++ {
 		n := (key + i) % uint32(len(r.ingesters))
-		result.Ingesters = append(result.Ingesters, r.ingesters[n])
+		result.Instances = append(result.Instances, r.ingesters[n])
 	}
 	return result, nil
 }
 
-func (r mockRing) GetAll(op ring.Operation) (ring.ReplicationSet, error) {
+func (r mockRing) GetAllHealthy(op ring.Operation) (ring.ReplicationSet, error) {
+	return r.GetReplicationSetForOperation(op)
+}
+
+func (r mockRing) GetReplicationSetForOperation(op ring.Operation) (ring.ReplicationSet, error) {
 	return ring.ReplicationSet{
-		Ingesters: r.ingesters,
+		Instances: r.ingesters,
 		MaxErrors: 1,
 	}, nil
 }
@@ -321,7 +395,7 @@ func (r mockRing) ReplicationFactor() int {
 	return int(r.replicationFactor)
 }
 
-func (r mockRing) IngesterCount() int {
+func (r mockRing) InstancesCount() int {
 	return len(r.ingesters)
 }
 
@@ -347,3 +421,5 @@ func (r mockRing) ShuffleShard(identifier string, size int) ring.ReadRing {
 func (r mockRing) ShuffleShardWithLookback(identifier string, size int, lookbackPeriod time.Duration, now time.Time) ring.ReadRing {
 	return r
 }
+
+func (r mockRing) CleanupShuffleShardCache(identifier string) {}

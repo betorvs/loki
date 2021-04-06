@@ -23,6 +23,7 @@ import (
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/storage"
 	"github.com/grafana/loki/pkg/util"
 )
 
@@ -207,6 +208,8 @@ func newStoreMock() *storeMock {
 	return &storeMock{}
 }
 
+func (s *storeMock) SetChunkFilterer(storage.RequestChunkFilterer) {}
+
 func (s *storeMock) SelectLogs(ctx context.Context, req logql.SelectLogParams) (iter.EntryIterator, error) {
 	args := s.Called(ctx, req)
 	res := args.Get(0)
@@ -279,7 +282,6 @@ func (s *storeMock) GetSeries(ctx context.Context, req logql.SelectLogParams) ([
 }
 
 func (s *storeMock) Stop() {
-
 }
 
 // readRingMock is a mocked version of a ReadRing, used in querier unit tests
@@ -288,10 +290,10 @@ type readRingMock struct {
 	replicationSet ring.ReplicationSet
 }
 
-func newReadRingMock(ingesters []ring.IngesterDesc) *readRingMock {
+func newReadRingMock(ingesters []ring.InstanceDesc) *readRingMock {
 	return &readRingMock{
 		replicationSet: ring.ReplicationSet{
-			Ingesters: ingesters,
+			Instances: ingesters,
 			MaxErrors: 0,
 		},
 	}
@@ -303,14 +305,14 @@ func (r *readRingMock) Describe(ch chan<- *prometheus.Desc) {
 func (r *readRingMock) Collect(ch chan<- prometheus.Metric) {
 }
 
-func (r *readRingMock) Get(key uint32, op ring.Operation, buf []ring.IngesterDesc) (ring.ReplicationSet, error) {
+func (r *readRingMock) Get(key uint32, op ring.Operation, buf []ring.InstanceDesc, _ []string, _ []string) (ring.ReplicationSet, error) {
 	return r.replicationSet, nil
 }
 
 func (r *readRingMock) ShuffleShard(identifier string, size int) ring.ReadRing {
 	// pass by value to copy
 	return func(r readRingMock) *readRingMock {
-		r.replicationSet.Ingesters = r.replicationSet.Ingesters[:size]
+		r.replicationSet.Instances = r.replicationSet.Instances[:size]
 		return &r
 	}(*r)
 }
@@ -319,7 +321,11 @@ func (r *readRingMock) BatchGet(keys []uint32, op ring.Operation) ([]ring.Replic
 	return []ring.ReplicationSet{r.replicationSet}, nil
 }
 
-func (r *readRingMock) GetAll(op ring.Operation) (ring.ReplicationSet, error) {
+func (r *readRingMock) GetAllHealthy(op ring.Operation) (ring.ReplicationSet, error) {
+	return r.replicationSet, nil
+}
+
+func (r *readRingMock) GetReplicationSetForOperation(op ring.Operation) (ring.ReplicationSet, error) {
 	return r.replicationSet, nil
 }
 
@@ -327,8 +333,8 @@ func (r *readRingMock) ReplicationFactor() int {
 	return 1
 }
 
-func (r *readRingMock) IngesterCount() int {
-	return len(r.replicationSet.Ingesters)
+func (r *readRingMock) InstancesCount() int {
+	return len(r.replicationSet.Instances)
 }
 
 func (r *readRingMock) Subring(key uint32, n int) ring.ReadRing {
@@ -336,7 +342,7 @@ func (r *readRingMock) Subring(key uint32, n int) ring.ReadRing {
 }
 
 func (r *readRingMock) HasInstance(instanceID string) bool {
-	for _, ing := range r.replicationSet.Ingesters {
+	for _, ing := range r.replicationSet.Instances {
 		if ing.Addr != instanceID {
 			return true
 		}
@@ -348,14 +354,16 @@ func (r *readRingMock) ShuffleShardWithLookback(identifier string, size int, loo
 	return r
 }
 
+func (r *readRingMock) CleanupShuffleShardCache(identifier string) {}
+
 func mockReadRingWithOneActiveIngester() *readRingMock {
-	return newReadRingMock([]ring.IngesterDesc{
+	return newReadRingMock([]ring.InstanceDesc{
 		{Addr: "test", Timestamp: time.Now().UnixNano(), State: ring.ACTIVE, Tokens: []uint32{1, 2, 3}},
 	})
 }
 
-func mockIngesterDesc(addr string, state ring.IngesterState) ring.IngesterDesc {
-	return ring.IngesterDesc{
+func mockInstanceDesc(addr string, state ring.InstanceState) ring.InstanceDesc {
+	return ring.InstanceDesc{
 		Addr:      addr,
 		Timestamp: time.Now().UnixNano(),
 		State:     state,

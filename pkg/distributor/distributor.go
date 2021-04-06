@@ -9,9 +9,10 @@ import (
 	cortex_distributor "github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/ring"
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
-	cortex_util "github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/limiter"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
 
@@ -24,7 +25,9 @@ import (
 
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/pkg/util/runtime"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -40,16 +43,7 @@ var (
 		Help:      "The total number of failed batch appends sent to ingesters.",
 	}, []string{"ingester"})
 
-	bytesIngested = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "loki",
-		Name:      "distributor_bytes_received_total",
-		Help:      "The total number of uncompressed bytes received per tenant",
-	}, []string{"tenant"})
-	linesIngested = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "loki",
-		Name:      "distributor_lines_received_total",
-		Help:      "The total number of lines received per tenant",
-	}, []string{"tenant"})
+	maxLabelCacheSize = 100000
 )
 
 // Config for a Distributor.
@@ -72,6 +66,7 @@ type Distributor struct {
 
 	cfg           Config
 	clientCfg     client.Config
+	tenantConfigs *runtime.TenantConfigs
 	ingestersRing ring.ReadRing
 	validator     *Validator
 	pool          *ring_client.Pool
@@ -85,10 +80,11 @@ type Distributor struct {
 
 	// Per-user rate limiter.
 	ingestionRateLimiter *limiter.RateLimiter
+	labelCache           *lru.Cache
 }
 
 // New a distributor creates.
-func New(cfg Config, clientCfg client.Config, ingestersRing ring.ReadRing, overrides *validation.Overrides, registerer prometheus.Registerer) (*Distributor, error) {
+func New(cfg Config, clientCfg client.Config, configs *runtime.TenantConfigs, ingestersRing ring.ReadRing, overrides *validation.Overrides, registerer prometheus.Registerer) (*Distributor, error) {
 	factory := cfg.factory
 	if factory == nil {
 		factory = func(addr string) (ring_client.PoolClient, error) {
@@ -120,14 +116,20 @@ func New(cfg Config, clientCfg client.Config, ingestersRing ring.ReadRing, overr
 		ingestionRateStrategy = newLocalIngestionRateStrategy(overrides)
 	}
 
+	labelCache, err := lru.New(maxLabelCacheSize)
+	if err != nil {
+		return nil, err
+	}
 	d := Distributor{
 		cfg:                  cfg,
 		clientCfg:            clientCfg,
+		tenantConfigs:        configs,
 		ingestersRing:        ingestersRing,
 		distributorsRing:     distributorsRing,
 		validator:            validator,
-		pool:                 cortex_distributor.NewPool(clientCfg.PoolConfig, ingestersRing, factory, cortex_util.Logger),
+		pool:                 cortex_distributor.NewPool(clientCfg.PoolConfig, ingestersRing, factory, util_log.Logger),
 		ingestionRateLimiter: limiter.NewRateLimiter(ingestionRateStrategy, 10*time.Second),
+		labelCache:           labelCache,
 	}
 
 	servs = append(servs, d.pool)
@@ -183,18 +185,6 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 		return nil, err
 	}
 
-	// Track metrics.
-	bytesCount := 0
-	lineCount := 0
-	for _, stream := range req.Streams {
-		for _, entry := range stream.Entries {
-			bytesCount += len(entry.Line)
-			lineCount++
-		}
-	}
-	bytesIngested.WithLabelValues(userID).Add(float64(bytesCount))
-	linesIngested.WithLabelValues(userID).Add(float64(lineCount))
-
 	// First we flatten out the request into a list of samples.
 	// We use the heuristic of 1 sample per TS to size the array.
 	// We also work out the hash value at the same time.
@@ -204,27 +194,36 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 	validatedSamplesSize := 0
 	validatedSamplesCount := 0
 
+	validationContext := d.validator.getValidationContextFor(userID)
+
 	for _, stream := range req.Streams {
-		if err := d.validator.ValidateLabels(userID, stream); err != nil {
+		stream.Labels, err = d.parseStreamLabels(validationContext, stream.Labels, &stream)
+		if err != nil {
 			validationErr = err
+			validation.DiscardedSamples.WithLabelValues(validation.InvalidLabels, userID).Add(float64(len(stream.Entries)))
+			bytes := 0
+			for _, e := range stream.Entries {
+				bytes += len(e.Line)
+			}
+			validation.DiscardedBytes.WithLabelValues(validation.InvalidLabels, userID).Add(float64(bytes))
 			continue
 		}
-
-		entries := make([]logproto.Entry, 0, len(stream.Entries))
+		n := 0
 		for _, entry := range stream.Entries {
-			if err := d.validator.ValidateEntry(userID, stream.Labels, entry); err != nil {
+			if err := d.validator.ValidateEntry(validationContext, stream.Labels, entry); err != nil {
 				validationErr = err
 				continue
 			}
-			entries = append(entries, entry)
+			stream.Entries[n] = entry
+			n++
 			validatedSamplesSize += len(entry.Line)
 			validatedSamplesCount++
 		}
+		stream.Entries = stream.Entries[:n]
 
-		if len(entries) == 0 {
+		if len(stream.Entries) == 0 {
 			continue
 		}
-		stream.Entries = entries
 		keys = append(keys, util.TokenFor(userID, stream.Labels))
 		streams = append(streams, streamTracker{
 			stream: stream,
@@ -240,23 +239,23 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 		// Return a 429 to indicate to the client they are being rate limited
 		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, userID).Add(float64(validatedSamplesCount))
 		validation.DiscardedBytes.WithLabelValues(validation.RateLimited, userID).Add(float64(validatedSamplesSize))
-		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg(int(d.ingestionRateLimiter.Limit(now, userID)), validatedSamplesCount, validatedSamplesSize))
+		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.RateLimitedErrorMsg, int(d.ingestionRateLimiter.Limit(now, userID)), validatedSamplesCount, validatedSamplesSize)
 	}
 
 	const maxExpectedReplicationSet = 5 // typical replication factor 3 plus one for inactive plus one for luck
-	var descs [maxExpectedReplicationSet]ring.IngesterDesc
+	var descs [maxExpectedReplicationSet]ring.InstanceDesc
 
 	samplesByIngester := map[string][]*streamTracker{}
-	ingesterDescs := map[string]ring.IngesterDesc{}
+	ingesterDescs := map[string]ring.InstanceDesc{}
 	for i, key := range keys {
-		replicationSet, err := d.ingestersRing.Get(key, ring.Write, descs[:0])
+		replicationSet, err := d.ingestersRing.Get(key, ring.Write, descs[:0], nil, nil)
 		if err != nil {
 			return nil, err
 		}
 
-		streams[i].minSuccess = len(replicationSet.Ingesters) - replicationSet.MaxErrors
+		streams[i].minSuccess = len(replicationSet.Instances) - replicationSet.MaxErrors
 		streams[i].maxFailures = replicationSet.MaxErrors
-		for _, ingester := range replicationSet.Ingesters {
+		for _, ingester := range replicationSet.Instances {
 			samplesByIngester[ingester.Addr] = append(samplesByIngester[ingester.Addr], &streams[i])
 			ingesterDescs[ingester.Addr] = ingester
 		}
@@ -268,7 +267,7 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 	}
 	tracker.samplesPending.Store(int32(len(streams)))
 	for ingester, samples := range samplesByIngester {
-		go func(ingester ring.IngesterDesc, samples []*streamTracker) {
+		go func(ingester ring.InstanceDesc, samples []*streamTracker) {
 			// Use a background context to make sure all ingesters get samples even if we return early
 			localCtx, cancel := context.WithTimeout(context.Background(), d.clientCfg.RemoteTimeout)
 			defer cancel()
@@ -290,7 +289,7 @@ func (d *Distributor) Push(ctx context.Context, req *logproto.PushRequest) (*log
 }
 
 // TODO taken from Cortex, see if we can refactor out an usable interface.
-func (d *Distributor) sendSamples(ctx context.Context, ingester ring.IngesterDesc, streamTrackers []*streamTracker, pushTracker *pushTracker) {
+func (d *Distributor) sendSamples(ctx context.Context, ingester ring.InstanceDesc, streamTrackers []*streamTracker, pushTracker *pushTracker) {
 	err := d.sendSamplesErr(ctx, ingester, streamTrackers)
 
 	// If we succeed, decrement each sample's pending count by one.  If we reach
@@ -322,7 +321,7 @@ func (d *Distributor) sendSamples(ctx context.Context, ingester ring.IngesterDes
 }
 
 // TODO taken from Cortex, see if we can refactor out an usable interface.
-func (d *Distributor) sendSamplesErr(ctx context.Context, ingester ring.IngesterDesc, streams []*streamTracker) error {
+func (d *Distributor) sendSamplesErr(ctx context.Context, ingester ring.InstanceDesc, streams []*streamTracker) error {
 	c, err := d.pool.GetClientFor(ingester.Addr)
 	if err != nil {
 		return err
@@ -346,4 +345,22 @@ func (d *Distributor) sendSamplesErr(ctx context.Context, ingester ring.Ingester
 // Check implements the grpc healthcheck
 func (*Distributor) Check(_ context.Context, _ *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+}
+
+func (d *Distributor) parseStreamLabels(vContext validationContext, key string, stream *logproto.Stream) (string, error) {
+	labelVal, ok := d.labelCache.Get(key)
+	if ok {
+		return labelVal.(string), nil
+	}
+	ls, err := logql.ParseLabels(key)
+	if err != nil {
+		return "", httpgrpc.Errorf(http.StatusBadRequest, validation.InvalidLabelsErrorMsg, key, err)
+	}
+	// ensure labels are correctly sorted.
+	if err := d.validator.ValidateLabels(vContext, ls, *stream); err != nil {
+		return "", err
+	}
+	lsVal := ls.String()
+	d.labelCache.Add(key, lsVal)
+	return lsVal, nil
 }

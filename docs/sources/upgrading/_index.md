@@ -17,7 +17,86 @@ If possible try to stay current and do sequential updates. If you want to skip v
 
 ## Master / Unreleased
 
-_add changes here which are unreleased_
+-_add changes here which are unreleased_
+
+## 2.2.0
+
+### Loki
+
+**Be sure to upgrade to 2.0 or 2.1 BEFORE upgrading to 2.2**
+
+In Loki 2.2 we changed the internal version of our chunk format from v2 to v3, this is a transparent change and is only relevant if you every try to _downgrade_ a Loki installation. We incorporated the code to read v3 chunks in 2.0.1 and 2.1, as well as 2.2 and any future releases.
+
+**If you upgrade to 2.2+ any chunks created can only be read by 2.0.1, 2.1 and 2.2+**
+
+This makes it important to first upgrade to 2.0, 2.0.1, or 2.1 **before** upgrading to 2.2 so that if you need to rollback for any reason you can do so easily.
+
+**Note:** 2.0 and 2.0.1 are identical in every aspect except 2.0.1 contains the code necessary to read the v3 chunk format. Therefor if you are on 2.0 and ugrade to 2.2, if you want to rollback, you must rollback to 2.0.1.
+
+### Loki Config
+
+**Read this if you use the query-frontend and have `sharded_queries_enabled: true`**
+
+We discovered query scheduling related to sharded queries over long time ranges could lead to unfair work scheduling by one single query in the per tenant work queue. 
+
+The `max_query_parallelism` setting is designed to limit how many split and sharded units of 'work' for a single query are allowed to be put into the per tenant work queue at one time. The previous behavior would split the query by time using the `split_queries_by_interval` and compare this value to `max_query_parallelism` when filling the queue, however with sharding enabled, every split was then sharded into 16 additional units of work after the `max_query_parallelism` limit was applied.
+
+In 2.2 we changed this behavior to apply the `max_query_parallelism` after splitting _and_ sharding a query resulting a more fair and expected queue scheduling per query.
+
+**What this means** Loki will be putting much less work into the work queue per query if you are using the query frontend and have sharding_queries_enabled (which you should).  **You may need to increase your `max_query_parallelism` setting if you are noticing slower query performance** In practice, you may not see a difference unless you were running a cluster with a LOT of queriers or queriers with a very high `parallelism` frontend_worker setting.
+
+You could consider multiplying your current `max_query_parallelism` setting by 16 to obtain the previous behavior, though in practice we suspect few people would really want it this high unless you have a significant querier worker pool.
+
+**Also be aware to make sure `max_outstanding_per_tenant` is always greater than `max_query_parallelism` or large queries will automatically fail with a 429 back to the user.**
+
+
+
+### Promtail 
+
+For 2.0 we eliminated the long deprecated `entry_parser` configuration in Promtail configs, however in doing so we introduced a very confusing and erroneous default behavior:
+
+If you did not specify a `pipeline_stages` entry you would be provided with a default which included the `docker` pipeline stage.  This can lead to some very confusing results.
+
+In [3404](https://github.com/grafana/loki/pull/3404), we corrected this behavior
+
+**If you are using docker, and any of your `scrape_configs` are missing a `pipeline_stages` definition**, you should add the following to obtain the correct behaviour:
+
+```yaml
+pipeline_stages:
+  - docker: {}
+```
+
+## 2.1.0
+
+The upgrade from 2.0.0 to 2.1.0 should be fairly smooth, please be aware of these two things:
+
+### Helm charts have moved!
+
+Helm charts are now located at: https://github.com/grafana/helm-charts/
+
+The helm repo URL is now: https://grafana.github.io/helm-charts
+
+### Fluent Bit plugin renamed
+
+Fluent bit officially supports Loki as an output plugin now! WoooHOOO!
+
+However this created a naming conflict with our existing output plugin (the new native output uses the name `loki`) so we have renamed our plugin.
+
+In time our plan is to deprecate and eliminate our output plugin in favor of the native Loki support. However until then you can continue using the plugin with the following change:
+
+Old:
+
+```
+[Output]
+    Name loki
+```
+
+New:
+
+```
+[Output]
+    Name grafana-loki
+```
 
 ## 2.0.0
 
@@ -58,23 +137,15 @@ There are three places we have hard coded the schema definition:
 
 Helm has shipped with the same internal schema in the values.yaml file for a very long time.
 
-If you are providing your own values.yaml file then there is no _required_ action because you will already have a fixed schema version.
+If you are providing your own values.yaml file then there is no _required_ action because you already have a schema definition.
 
-**If you are not providing your own values.yaml file, you will need to make one! and at a minimum it will need this config:**
+**If you are not providing your own values.yaml file, you will need to make one!**
 
-```yaml
-schema_config:
-  configs:
-    - from: 2018-04-15
-      store: boltdb
-      object_store: filesystem
-      schema: v9
-      index:
-        prefix: index_
-        period: 168h
-```
+We suggest using the included [values.yaml file from the 1.6.0 tag](https://raw.githubusercontent.com/grafana/loki/v1.6.0/production/helm/loki/values.yaml)
 
 This matches what the default values.yaml file had prior to 2.0 and is necessary for Loki to work post 2.0 
+
+As mentioned above, you should also consider looking at moving to the v11 schema and boltdb-shipper [see below](#upgrading-schema-to-use-boltdb-shipper-andor-v11-schema) for more information.
 
 ##### Tanka
 
@@ -162,6 +233,10 @@ Ingesters now expose a new RPC method that queriers use when the index type is `
 Queriers generally roll out faster than ingesters, so if new queriers query older ingesters using the new RPC, the queries would fail.
 To avoid any query downtime during the upgrade, rollout ingesters before queriers.
 
+#### If running the compactor, ensure it has delete permissions for the object storage.
+
+The compactor is an optional but suggested component that combines and deduplicates the boltdb-shipper index files. When compacting index files, the compactor writes a new file and deletes unoptimized files. Ensure that the compactor has appropriate permissions for deleting files, for example, s3:DeleteObject permission for AWS S3.
+
 ### IMPORTANT: `results_cache.max_freshness` removed from YAML config
 
 The `max_freshness` config from `results_cache` has been removed in favour of another flag called `max_cache_freshness_per_query` in `limits_config` which has the same effect.
@@ -203,7 +278,7 @@ schema_config:
 ④ Make sure this matches your existing config (e.g. maybe you were using gcs for your object_store)  
 ⑤ 24h is required for boltdb-shipper  
  
-There are more examples on the [Storage description page]({{< relref "../storage/_index.md#examples" >}})
+There are more examples on the [Storage description page]({{< relref "../storage/_index.md#examples" >}}) including the information you need to setup the `storage` section for boltdb-shipper.
 
 
 ## 1.6.0

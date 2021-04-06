@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -110,18 +110,14 @@ promtail_custom_total_lines_count{test="app"} 2
 
 func TestMetricsPipeline(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	pl, err := NewPipeline(util.Logger, loadConfig(testMetricYaml), nil, registry)
+	pl, err := NewPipeline(util_log.Logger, loadConfig(testMetricYaml), nil, registry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
-	lbls["test"] = "app"
-	ts := time.Now()
-	extracted := map[string]interface{}{}
-	entry := testMetricLogLine1
-	pl.Process(lbls, extracted, &ts, &entry)
-	entry = testMetricLogLine2
-	pl.Process(lbls, extracted, &ts, &entry)
+
+	out := <-pl.Run(withInboundEntries(newEntry(nil, model.LabelSet{"test": "app"}, testMetricLogLine1, time.Now())))
+	out.Line = testMetricLogLine2
+	<-pl.Run(withInboundEntries(out))
 
 	if err := testutil.GatherAndCompare(registry,
 		strings.NewReader(expectedMetrics)); err != nil {
@@ -137,12 +133,8 @@ func TestPipelineWithMissingKey_Metrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	Debug = true
-	ts := time.Now()
-	entry := testMetricLogLineWithMissingKey
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
+	processEntries(pl, newEntry(nil, nil, testMetricLogLineWithMissingKey, time.Now()))
 	expectedLog := "level=debug msg=\"failed to convert extracted value to string, can't perform value comparison\" metric=bloki_count err=\"can't convert <nil> to string\""
 	if !(strings.Contains(buf.String(), expectedLog)) {
 		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
@@ -167,14 +159,17 @@ pipeline_stages:
         action: inc
 `
 
-const expectedDropMetrics = `# HELP promtail_custom_loki_count should only inc on non dropped labels
+const expectedDropMetrics = `# HELP logentry_dropped_lines_total A count of all log lines dropped as a result of a pipeline stage
+# TYPE logentry_dropped_lines_total counter
+logentry_dropped_lines_total{reason="match_stage"} 1
+# HELP promtail_custom_loki_count should only inc on non dropped labels
 # TYPE promtail_custom_loki_count counter
-promtail_custom_loki_count 1.0
+promtail_custom_loki_count 1
 `
 
 func TestMetricsWithDropInPipeline(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	pl, err := NewPipeline(util.Logger, loadConfig(testMetricWithDropYaml), nil, registry)
+	pl, err := NewPipeline(util_log.Logger, loadConfig(testMetricWithDropYaml), nil, registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,13 +177,16 @@ func TestMetricsWithDropInPipeline(t *testing.T) {
 	droppingLabels := model.LabelSet{
 		"drop": "true",
 	}
+	in := make(chan Entry)
+	out := pl.Run(in)
 
-	ts := time.Now()
-	extracted := map[string]interface{}{}
-	entry := testMetricLogLine1
-	pl.Process(lbls, extracted, &ts, &entry)
-	entry = testMetricLogLine2
-	pl.Process(droppingLabels, extracted, &ts, &entry)
+	in <- newEntry(nil, lbls, testMetricLogLine1, time.Now())
+	e := <-out
+	e.Labels = droppingLabels
+	e.Line = testMetricLogLine2
+	in <- e
+	close(in)
+	<-out
 
 	if err := testutil.GatherAndCompare(registry,
 		strings.NewReader(expectedDropMetrics)); err != nil {
@@ -198,7 +196,7 @@ func TestMetricsWithDropInPipeline(t *testing.T) {
 
 var metricTestInvalidIdle = "10f"
 
-func Test(t *testing.T) {
+func TestValidateMetricsConfig(t *testing.T) {
 	tests := map[string]struct {
 		config MetricsConfig
 		err    error
@@ -222,7 +220,7 @@ func Test(t *testing.T) {
 					IdleDuration: &metricTestInvalidIdle,
 				},
 			},
-			errors.Errorf(ErrInvalidIdleDur, "time: unknown unit f in duration 10f"),
+			errors.Errorf(ErrInvalidIdleDur, `time: unknown unit "f" in duration "10f"`),
 		},
 		"valid": {
 			MetricsConfig{
@@ -262,11 +260,11 @@ func TestDefaultIdleDuration(t *testing.T) {
 			},
 		},
 	}
-	ms, err := New(util.Logger, nil, StageTypeMetric, metricsConfig, registry)
+	ms, err := New(util_log.Logger, nil, StageTypeMetric, metricsConfig, registry)
 	if err != nil {
 		t.Fatalf("failed to create stage with metrics: %v", err)
 	}
-	assert.Equal(t, int64(5*time.Minute.Seconds()), ms.(*metricStage).cfg["total_keys"].maxIdleSec)
+	assert.Equal(t, int64(5*time.Minute.Seconds()), ms.(*stageProcessor).Processor.(*metricStage).cfg["total_keys"].maxIdleSec)
 }
 
 var labelFoo = model.LabelSet(map[model.LabelName]model.LabelValue{"foo": "bar", "bar": "foo"})
@@ -360,27 +358,25 @@ func TestMetricStage_Process(t *testing.T) {
 	}
 
 	registry := prometheus.NewRegistry()
-	jsonStage, err := New(util.Logger, nil, StageTypeJSON, jsonConfig, registry)
+	jsonStage, err := New(util_log.Logger, nil, StageTypeJSON, jsonConfig, registry)
 	if err != nil {
 		t.Fatalf("failed to create stage with metrics: %v", err)
 	}
-	regexStage, err := New(util.Logger, nil, StageTypeRegex, regexConfig, registry)
+	regexStage, err := New(util_log.Logger, nil, StageTypeRegex, regexConfig, registry)
 	if err != nil {
 		t.Fatalf("failed to create stage with metrics: %v", err)
 	}
-	metricStage, err := New(util.Logger, nil, StageTypeMetric, metricsConfig, registry)
+	metricStage, err := New(util_log.Logger, nil, StageTypeMetric, metricsConfig, registry)
 	if err != nil {
 		t.Fatalf("failed to create stage with metrics: %v", err)
 	}
-	var ts = time.Now()
-	var entry = logFixture
-	extr := map[string]interface{}{}
-	jsonStage.Process(labelFoo, extr, &ts, &entry)
-	regexStage.Process(labelFoo, extr, &ts, &regexLogFixture)
-	metricStage.Process(labelFoo, extr, &ts, &entry)
+	out := processEntries(jsonStage, newEntry(nil, labelFoo, logFixture, time.Now()))
+	out[0].Line = regexLogFixture
+	out = processEntries(regexStage, out...)
+	out = processEntries(metricStage, out...)
+	out[0].Labels = labelFu
 	// Process the same extracted values again with different labels so we can verify proper metric/label assignments
-	metricStage.Process(labelFu, extr, &ts, &entry)
-
+	_ = processEntries(metricStage, out...)
 	names := metricNames(metricsConfig)
 	if err := testutil.GatherAndCompare(registry,
 		strings.NewReader(goldenMetrics), names...); err != nil {

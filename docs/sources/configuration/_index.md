@@ -24,6 +24,7 @@ Configuration examples can be found in the [Configuration Examples](examples/) d
   - [ingester_config](#ingester_config)
   - [consul_config](#consul_config)
   - [etcd_config](#etcd_config)
+  - [compactor_config](#compactor_config)
   - [memberlist_config](#memberlist_config)
   - [storage_config](#storage_config)
   - [chunk_store_config](#chunk_store_config)
@@ -64,7 +65,34 @@ command line. The file is written in [YAML format](https://en.wikipedia.org/wiki
 defined by the scheme below. Brackets indicate that a parameter is optional. For
 non-list parameters the value is set to the specified default.
 
-Generic placeholders are defined as follows:
+### Use environment variables in the configuration
+
+> **Note:** This feature is only available in Loki 2.1+.
+
+You can use environment variable references in the configuration file to set values that need to be configurable during deployment.
+To do this, pass `-config.expand-env=true` and use:
+
+```
+${VAR}
+```
+
+Where VAR is the name of the environment variable.
+
+Each variable reference is replaced at startup by the value of the environment variable.
+The replacement is case-sensitive and occurs before the YAML file is parsed.
+References to undefined variables are replaced by empty strings unless you specify a default value or custom error text.
+
+To specify a default value, use:
+
+```
+${VAR:default_value}
+```
+
+Where default_value is the value to use if the environment variable is undefined.
+
+Pass the `-config.expand-env` flag at the command line to enable this way of setting configs.
+
+### Generic placeholders:
 
 - `<boolean>` : a boolean that can take the values `true` or `false`
 - `<int>` : any integer matching the regular expression `[1-9]+[0-9]*`
@@ -76,7 +104,7 @@ Generic placeholders are defined as follows:
 - `<string>` : a regular string
 - `<secret>` : a regular string that is a secret, such as a password
 
-Supported contents and default values of `loki.yaml`:
+### Supported contents and default values of `loki.yaml`:
 
 ```yaml
 # The module to run Loki with. Supported values
@@ -123,6 +151,9 @@ Supported contents and default values of `loki.yaml`:
 
 # Configures the chunk index schema and where it is stored.
 [schema_config: <schema_config>]
+
+# Configures the compactor component which compacts index shards for performance.
+[compactor: <compactor_config>]
 
 # Configures limits per-tenant or globally
 [limits_config: <limits_config>]
@@ -230,10 +261,6 @@ ring:
     # The CLI flags prefix for this block config is: distributor.ring
     [etcd: <etcd_config>]
 
-    # Configuration for Gossip memberlist. Only applies if store is "memberlist"
-    # The CLI flags prefix for this block config is: distributor.ring
-    [memberlist: <memberlist_config>]
-
   # The heartbeat timeout after which ingesters are skipped for
   # reading and writing.
   # CLI flag: -distributor.ring.heartbeat-timeout
@@ -288,7 +315,7 @@ The query_frontend_config configures the Loki query-frontend.
 # CLI flag: -querier.compress-http-responses
 [compress_responses: <boolean> | default = false]
 
-# URL of downstream Prometheus.
+# URL of downstream Loki.
 # CLI flag: -frontend.downstream-url
 [downstream_url: <string> | default = ""]
 
@@ -296,6 +323,10 @@ The query_frontend_config configures the Loki query-frontend.
 # Set to < 0 to enable on all queries.
 # CLI flag: -frontend.log-queries-longer-than
 [log_queries_longer_than: <duration> | default = 0s]
+
+# URL of querier for tail proxy.
+# CLI flag: -frontend.tail-proxy-url
+[tail_proxy_url: <string> | default = ""]
 ```
 
 ## queryrange_config
@@ -310,6 +341,7 @@ The queryrange_config configures the query splitting and caching in the Loki que
 # CLI flag: -querier.split-queries-by-interval
 [split_queries_by_interval: <duration> | default = 0s]
 
+# Deprecated: Split queries by day and execute in parallel. Use -querier.split-queries-by-interval instead.
 # CLI flag: -querier.split-queries-by-day
 [split_queries_by_day: <boolean> | default = false]
 
@@ -336,7 +368,7 @@ results_cache:
 [parallelise_shardable_queries: <boolean> | default = false]
 ```
 
-## `ruler_config`
+## ruler_config
 
 The `ruler_config` configures the Loki ruler.
 
@@ -556,11 +588,11 @@ storage:
   local:
     # Directory to scan for rules
     # CLI flag: -ruler.storage.local.directory
-    [directory: <string> | default = ""]
+    [directory: <filename> | default = ""]
 
 # File path to store temporary rule files
 # CLI flag: -ruler.rule-path
-[rule_path: <string> | default = "/rules"]
+[rule_path: <filename> | default = "/rules"]
 
 # Comma-separated list of Alertmanager URLs to send notifications to.
 # Each Alertmanager URL is treated as a separate group in the configuration.
@@ -747,10 +779,6 @@ lifecycler:
       # CLI flag: <no prefix>
       [etcd: <etcd_config>]
 
-      # Configuration for Gossip memberlist. Only applies if store is "memberlist"
-      # CLI flag: <no prefix>
-      [memberlist: <memberlist_config>]
-
     # The heartbeat timeout after which ingesters are skipped for reads/writes.
     # CLI flag: -ring.heartbeat-timeout
     [heartbeat_timeout: <duration> | default = 1m]
@@ -863,6 +891,29 @@ lifecycler:
 # Use a value of -1 to allow the ingester to query the store infinitely far back in time.
 # CLI flag: -ingester.query-store-max-look-back-period
 [query_store_max_look_back_period: <duration> | default = 0]
+
+
+# The ingester WAL (Write Ahead Log) records incoming logs and stores them on the local file system in order to guarantee persistence of acknowledged data in the event of a process crash.
+wal:
+  # Enables writing to WAL.
+  # CLI flag: -ingester.wal-enabled
+  [enabled: <boolean> | default = false]
+
+  # Directory where the WAL data should be stored and/or recovered from.
+  # CLI flag: -ingester.wal-dir
+  [dir: <filename> | default = "wal"]
+
+  # When WAL is enabled, should chunks be flushed to long-term storage on shutdown.
+  # CLI flag: -ingester.flush-on-shutdown
+  [flush_on_shutdown: <boolean> | default = false]
+
+  # Interval at which checkpoints should be created.
+  # CLI flag: ingester.checkpoint-duration
+  [checkpoint_duration: <duration> | default = 5m]
+
+  # Maximum memory size the WAL may use during replay. After hitting this it will flush data to storage before continuing.
+  # A unit suffix (KB, MB, GB) may be applied.
+  [replay_memory_ceiling: <string> | default = 4GB]
 ```
 
 ## consul_config
@@ -1134,7 +1185,7 @@ aws:
     # CLI flag: -dynamodb.chunk.get-max-parallelism
     [chunk_get_max_parallelism: <int> | default = 32]
 
-# Configures storing chunks in Bigtable. Required fields only required
+# Configures storing indexes in Bigtable. Required fields only required
 # when bigtable is defined in config.
 bigtable:
   # BigTable project ID
@@ -1149,7 +1200,7 @@ bigtable:
   # The CLI flags prefix for this block config is: bigtable
   [grpc_client_config: <grpc_client_config>]
 
-# Configures storing index in GCS. Required fields only required
+# Configures storing chunks in GCS. Required fields only required
 # when gcs is defined in config.
 gcs:
   # Name of GCS bucket to put chunks in.
@@ -1298,6 +1349,36 @@ filesystem:
   # CLI flag: -local.chunk-directory
   directory: <string>
 
+# Configures storing index in an Object Store(GCS/S3/Azure/Swift/Filesystem) in the form of boltdb files.
+# Required fields only required when boltdb-shipper is defined in config.
+boltdb_shipper:
+  # Directory where ingesters would write boltdb files which would then be
+  # uploaded by shipper to configured storage
+  # CLI flag: -boltdb.shipper.active-index-directory
+  [active_index_directory: <string> | default = ""]
+
+  # Shared store for keeping boltdb files. Supported types: gcs, s3, azure,
+  # filesystem
+  # CLI flag: -boltdb.shipper.shared-store
+  [shared_store: <string> | default = ""]
+
+  # Cache location for restoring boltDB files for queries
+  # CLI flag: -boltdb.shipper.cache-location
+  [cache_location: <string> | default = ""]
+
+  # TTL for boltDB files restored in cache for queries
+  # CLI flag: -boltdb.shipper.cache-ttl
+  [cache_ttl: <duration> | default = 24h]
+
+  # Resync downloaded files with the storage
+  # CLI flag: -boltdb.shipper.resync-interval
+  [resync_interval: <duration> | default = 5m]
+
+  # Number of days of index to be kept downloaded for queries. Works only with
+  # tables created with 24h period.
+  # CLI flag: -boltdb.shipper.query-ready-num-days
+  [query_ready_num_days: <int> | default = 0]
+
 # Cache validity for active index entries. Should be no higher than
 # the chunk_idle_period in the ingester settings.
 # CLI flag: -store.index-cache-validity
@@ -1397,7 +1478,7 @@ memcached_client:
 
   # The maximum number of idle connections in the memcached client pool.
   # CLI flag: -<prefix>.memcached.max-idle-conns
-  [max_idle_conns: <int> | default = 100]
+  [max_idle_conns: <int> | default = 16]
 
   # The period with which to poll the DNS for memcached servers.
   # CLI flag: -<prefix>.memcached.update-interval
@@ -1527,6 +1608,28 @@ chunks:
 [row_shards: <int> | default = 16]
 ```
 
+## compactor_config
+
+The `compactor_config` block configures the compactor component. This component periodically
+compacts index shards to more performant forms.
+
+```yaml
+# Directory where files can be downloaded for compaction.
+[working_directory: <string>]
+
+# The shared store used for storing boltdb files.
+# Supported types: gcs, s3, azure, swift, filesystem.
+[shared_store: <string>]
+
+# Prefix to add to object keys in shared store.
+# Path separator(if any) should always be a '/'.
+# Prefix should never start with a separator but should always end with it.
+[shared_store_key_prefix: <string> | default = "index/"]
+
+# Interval at which to re-run the compaction operation.
+[compaction_interval: <duration> | default = 2h]
+```
+
 ## limits_config
 
 The `limits_config` block configures global and per-tenant limits for ingesting
@@ -1597,7 +1700,7 @@ logs in Loki.
 # CLI flag: -distributor.max-line-size
 [max_line_size: <string> | default = none ]
 
-# Maximum number of log entries that will be returned for a query. 0 to disable.
+# Maximum number of log entries that will be returned for a query.
 # CLI flag: -validation.max-entries-limit
 [max_entries_limit_per_query: <int> | default = 5000 ]
 
@@ -1620,6 +1723,11 @@ logs in Loki.
 # CLI flag: -querier.max-query-parallelism
 [max_query_parallelism: <int> | default = 14]
 
+# Limit the maximum of unique series that is returned by a metric query.
+# When the limit is reached an error is returned.
+# CLI flag: -querier.max-query-series
+[max_query_series: <int> | default = 500]
+
 # Cardinality limit for index queries.
 # CLI flag: -store.cardinality-limit
 [cardinality_limit: <int> | default = 100000]
@@ -1628,6 +1736,18 @@ logs in Loki.
 # CLI flag: -querier.max-streams-matcher-per-query
 [max_streams_matchers_per_query: <int> | default = 1000]
 
+# Duration to delay the evaluation of rules to ensure.
+# CLI flag: -ruler.evaluation-delay-duration
+[ruler_evaluation_delay_duration: <duration> | default = 0s]
+
+# Maximum number of rules per rule group per-tenant. 0 to disable.
+# CLI flag: -ruler.max-rules-per-rule-group
+[ruler_max_rules_per_rule_group: <int> | default = 0]
+
+# Maximum number of rule groups per-tenant. 0 to disable.
+# CLI flag: -ruler.max-rule-groups-per-tenant
+[ruler_max_rule_groups_per_tenant: <int> | default = 0]
+
 # Feature renamed to 'runtime configuration', flag deprecated in favor of -runtime-config.file (runtime_config.file in YAML).
 # CLI flag: -limits.per-user-override-config
 [per_tenant_override_config: <string>]
@@ -1635,6 +1755,10 @@ logs in Loki.
 # Feature renamed to 'runtime configuration', flag deprecated in favor of -runtime-config.reload-period (runtime_config.period in YAML).
 # CLI flag: -limits.per-user-override-period
 [per_tenant_override_period: <duration> | default = 10s]
+
+# Most recent allowed cacheable result per-tenant, to prevent caching very recent results that might still be in flux.
+# CLI flag: -frontend.max-cache-freshness
+[max_cache_freshness_per_query: <duration> | default = 1m]
 ```
 
 ### grpc_client_config
@@ -1849,3 +1973,4 @@ multi_kv_config:
     mirror-enabled: false
     primary: consul
 ```
+### Generic placeholders

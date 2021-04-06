@@ -22,7 +22,9 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/wal"
@@ -51,13 +53,14 @@ type WriteStorage struct {
 	samplesIn         *ewmaRate
 	flushDeadline     time.Duration
 	interner          *pool
+	scraper           ReadyScrapeManager
 
 	// For timestampTracker.
-	highestTimestamp *maxGauge
+	highestTimestamp *maxTimestamp
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
-func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, walDir string, flushDeadline time.Duration) *WriteStorage {
+func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, walDir string, flushDeadline time.Duration, sm ReadyScrapeManager) *WriteStorage {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -71,7 +74,8 @@ func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, walDir string
 		samplesIn:         newEWMARate(ewmaWeight, shardUpdateDuration),
 		walDir:            walDir,
 		interner:          newPool(),
-		highestTimestamp: &maxGauge{
+		scraper:           sm,
+		highestTimestamp: &maxTimestamp{
 			Gauge: prometheus.NewGauge(prometheus.GaugeOpts{
 				Namespace: namespace,
 				Subsystem: subsystem,
@@ -131,6 +135,9 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			URL:              rwConf.URL,
 			Timeout:          rwConf.RemoteTimeout,
 			HTTPClientConfig: rwConf.HTTPClientConfig,
+			SigV4Config:      rwConf.SigV4Config,
+			Headers:          rwConf.Headers,
+			RetryOnRateLimit: rwConf.QueueConfig.RetryOnRateLimit,
 		})
 		if err != nil {
 			return err
@@ -154,12 +161,14 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rws.walDir,
 			rws.samplesIn,
 			rwConf.QueueConfig,
+			rwConf.MetadataConfig,
 			conf.GlobalConfig.ExternalLabels,
 			rwConf.WriteRelabelConfigs,
 			c,
 			rws.flushDeadline,
 			rws.interner,
 			rws.highestTimestamp,
+			rws.scraper,
 		)
 		// Keep track of which queues are new so we know which to start.
 		newHashes = append(newHashes, hash)
@@ -202,11 +211,11 @@ type timestampTracker struct {
 	writeStorage         *WriteStorage
 	samples              int64
 	highestTimestamp     int64
-	highestRecvTimestamp *maxGauge
+	highestRecvTimestamp *maxTimestamp
 }
 
-// Add implements storage.Appender.
-func (t *timestampTracker) Add(_ labels.Labels, ts int64, _ float64) (uint64, error) {
+// Append implements storage.Appender.
+func (t *timestampTracker) Append(_ uint64, _ labels.Labels, ts int64, _ float64) (uint64, error) {
 	t.samples++
 	if ts > t.highestTimestamp {
 		t.highestTimestamp = ts
@@ -214,10 +223,8 @@ func (t *timestampTracker) Add(_ labels.Labels, ts int64, _ float64) (uint64, er
 	return 0, nil
 }
 
-// AddFast implements storage.Appender.
-func (t *timestampTracker) AddFast(_ uint64, ts int64, v float64) error {
-	_, err := t.Add(nil, ts, v)
-	return err
+func (t *timestampTracker) AppendExemplar(_ uint64, _ labels.Labels, _ exemplar.Exemplar) (uint64, error) {
+	return 0, nil
 }
 
 // Commit implements storage.Appender.

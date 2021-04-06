@@ -1,12 +1,12 @@
 .DEFAULT_GOAL := all
 .PHONY: all images check-generated-files logcli loki loki-debug promtail promtail-debug loki-canary lint test clean yacc protos touch-protobuf-sources touch-protos
-.PHONY: helm helm-install helm-upgrade helm-publish helm-debug helm-clean
 .PHONY: docker-driver docker-driver-clean docker-driver-enable docker-driver-push
 .PHONY: fluent-bit-image, fluent-bit-push, fluent-bit-test
 .PHONY: fluentd-image, fluentd-push, fluentd-test
 .PHONY: push-images push-latest save-images load-images promtail-image loki-image build-image
 .PHONY: bigtable-backup, push-bigtable-backup
 .PHONY: benchmark-store, drone, check-mod
+.PHONY: migrate migrate-image
 
 SHELL = /usr/bin/env bash
 
@@ -39,7 +39,7 @@ IMAGE_NAMES := $(foreach dir,$(DOCKER_IMAGE_DIRS),$(patsubst %,$(IMAGE_PREFIX)%,
 # make BUILD_IN_CONTAINER=false target
 # or you can override this with an environment variable
 BUILD_IN_CONTAINER ?= true
-BUILD_IMAGE_VERSION := 0.10.0
+BUILD_IMAGE_VERSION := 0.13.0
 
 # Docker image info
 IMAGE_PREFIX ?= grafana
@@ -226,6 +226,16 @@ cmd/promtail/promtail-debug: $(APP_GO_FILES) pkg/promtail/server/ui/assets_vfsda
 	CGO_ENABLED=$(PROMTAIL_CGO) go build $(PROMTAIL_DEBUG_GO_FLAGS) -o $@ ./$(@D)
 	$(NETGO_CHECK)
 
+###############
+# Migrate #
+###############
+
+migrate: cmd/migrate/migrate
+
+cmd/migrate/migrate: $(APP_GO_FILES) cmd/migrate/main.go
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
+	$(NETGO_CHECK)
+
 #############
 # Releasing #
 #############
@@ -236,7 +246,7 @@ dist: clean
 	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/loki
 	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/logcli
 	CGO_ENABLED=0 $(GOX) -osarch="linux/amd64 linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/loki-canary
-	CGO_ENABLED=0 $(GOX) -osarch="linux/arm64 linux/arm darwin/amd64 windows/amd64 freebsd/amd64" ./cmd/promtail
+	CGO_ENABLED=0 $(GOX) -osarch="linux/arm64 linux/arm darwin/amd64 windows/amd64 windows/386 freebsd/amd64" ./cmd/promtail
 	CGO_ENABLED=1 $(CGO_GOX) -osarch="linux/amd64" ./cmd/promtail
 	for i in dist/*; do zip -j -m $$i.zip $$i; done
 	pushd dist && sha256sum * > SHA256SUMS && popd
@@ -272,8 +282,9 @@ clean:
 	rm -rf .cache
 	rm -rf cmd/docker-driver/rootfs
 	rm -rf dist/
-	rm -rf cmd/fluent-bit/out_loki.h
-	rm -rf cmd/fluent-bit/out_loki.so
+	rm -rf cmd/fluent-bit/out_grafana_loki.h
+	rm -rf cmd/fluent-bit/out_grafana_loki.so
+	rm -rf cmd/migrate/migrate
 	go clean $(MOD_FLAG) ./...
 
 #########
@@ -329,63 +340,12 @@ else
 endif
 
 
-########
-# Helm #
-########
-
-CHARTS := production/helm/loki production/helm/promtail production/helm/fluent-bit production/helm/loki-stack
-
-helm: PACKAGE_ARGS ?=
-helm:
-	-rm -f production/helm/*/requirements.lock
-	@set -e; \
-	helm init -c; \
-	helm repo add elastic https://helm.elastic.co ; \
-	helm repo add grafana https://grafana.github.io/helm-charts ; \
-	helm repo add prometheus https://prometheus-community.github.io/helm-charts ; \
-	for chart in $(CHARTS); do \
-		helm dependency build $$chart; \
-		helm lint $$chart; \
-		helm package $(PACKAGE_ARGS) $$chart; \
-	done
-	rm -f production/helm/*/requirements.lock
-
-helm-install:
-	kubectl apply -f tools/helm.yaml
-	helm init --wait --service-account helm --upgrade
-	HELM_ARGS="$(HELM_ARGS)" $(MAKE) helm-upgrade
-
-helm-install-fluent-bit:
-	HELM_ARGS="--set fluent-bit.enabled=true,promtail.enabled=false" $(MAKE) helm-install
-
-
-helm-upgrade: helm
-	helm upgrade --wait --install $(ARGS) loki-stack ./production/helm/loki-stack \
-	--set promtail.image.tag=$(IMAGE_TAG) --set loki.image.tag=$(IMAGE_TAG) --set fluent-bit.image.tag=$(IMAGE_TAG) -f tools/dev.values.yaml $(HELM_ARGS)
-
-helm-publish: helm
-	cp production/helm/README.md index.md
-	git config user.email "$CIRCLE_USERNAME@users.noreply.github.com"
-	git config user.name "${CIRCLE_USERNAME}"
-	git checkout gh-pages || (git checkout --orphan gh-pages && git rm -rf . > /dev/null)
-	mkdir -p charts
-	mv *.tgz *.tgz.prov index.md charts/
-	helm repo index charts/
-	git add charts/
-	git commit -m "[skip ci] Publishing helm charts: ${CIRCLE_SHA1}"
-	git push origin gh-pages
-
-helm-debug: ARGS=--dry-run --debug
-helm-debug: helm-upgrade
-
-helm-clean:
-	-helm delete --purge loki-stack
-
 #################
 # Docker Driver #
 #################
 
 # optionally set the tag or the arch suffix (-arm64)
+LOKI_DOCKER_DRIVER ?= "grafana/loki-docker-driver"
 PLUGIN_TAG ?= $(IMAGE_TAG)
 PLUGIN_ARCH ?=
 
@@ -396,31 +356,31 @@ docker-driver: docker-driver-clean
 	(docker export $$ID | tar -x -C cmd/docker-driver/rootfs) && \
 	docker rm -vf $$ID
 	docker rmi rootfsimage -f
-	docker plugin create grafana/loki-docker-driver:$(PLUGIN_TAG)$(PLUGIN_ARCH) cmd/docker-driver
-	docker plugin create grafana/loki-docker-driver:latest$(PLUGIN_ARCH) cmd/docker-driver
+	docker plugin create $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH) cmd/docker-driver
+	docker plugin create $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH) cmd/docker-driver
 
 cmd/docker-driver/docker-driver: $(APP_GO_FILES)
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
 	$(NETGO_CHECK)
 
 docker-driver-push: docker-driver
-	docker plugin push grafana/loki-docker-driver:$(PLUGIN_TAG)$(PLUGIN_ARCH)
-	docker plugin push grafana/loki-docker-driver:latest$(PLUGIN_ARCH)
+	docker plugin push $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
+	docker plugin push $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH)
 
 docker-driver-enable:
-	docker plugin enable grafana/loki-docker-driver:$(PLUGIN_TAG)$(PLUGIN_ARCH)
+	docker plugin enable $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
 
 docker-driver-clean:
-	-docker plugin disable grafana/loki-docker-driver:$(PLUGIN_TAG)$(PLUGIN_ARCH)
-	-docker plugin rm grafana/loki-docker-driver:$(PLUGIN_TAG)$(PLUGIN_ARCH)
-	-docker plugin rm grafana/loki-docker-driver:latest$(PLUGIN_ARCH)
+	-docker plugin disable $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
+	-docker plugin rm $(LOKI_DOCKER_DRIVER):$(PLUGIN_TAG)$(PLUGIN_ARCH)
+	-docker plugin rm $(LOKI_DOCKER_DRIVER):latest$(PLUGIN_ARCH)
 	rm -rf cmd/docker-driver/rootfs
 
 #####################
 # fluent-bit plugin #
 #####################
 fluent-bit-plugin:
-	go build $(DYN_GO_FLAGS) -buildmode=c-shared -o cmd/fluent-bit/out_loki.so ./cmd/fluent-bit/
+	go build $(DYN_GO_FLAGS) -buildmode=c-shared -o cmd/fluent-bit/out_grafana_loki.so ./cmd/fluent-bit/
 
 fluent-bit-image:
 	$(SUDO) docker build -t $(IMAGE_PREFIX)/fluent-bit-plugin-loki:$(IMAGE_TAG) -f cmd/fluent-bit/Dockerfile .
@@ -554,6 +514,11 @@ loki-querytee-image-cross:
 loki-querytee-push: loki-querytee-image-cross
 	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/loki-querytee:$(IMAGE_TAG)
 
+# migrate-image
+migrate-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-migrate:$(IMAGE_TAG) -f cmd/migrate/Dockerfile .
+
+
 # build-image (only amd64)
 build-image: OCI_PLATFORMS=
 build-image:
@@ -617,3 +582,9 @@ lint-jsonnet:
 fmt-jsonnet:
 	@find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
 		xargs -n 1 -- jsonnetfmt -i
+
+# usage: FUZZ_TESTCASE_PATH=/tmp/testcase make test-fuzz
+# this will run the fuzzing using /tmp/testcase and save benchmark locally.
+test-fuzz:
+	go test -timeout 30s -tags dev,gofuzz -cpuprofile cpu.prof -memprofile mem.prof  \
+		-run ^Test_Fuzz$$ github.com/grafana/loki/pkg/logql -v -count=1 -timeout=0s

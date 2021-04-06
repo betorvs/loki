@@ -278,7 +278,13 @@ module Fluent
           when :key_value
             formatted_labels = []
             record.each do |k, v|
-              formatted_labels.push(%(#{k}="#{v}"))
+              # Escape double quotes and backslashes by prefixing them with a backslash
+              v = v.to_s.gsub(%r{(["\\])}, '\\\\\1')
+              if v.include?(' ') || v.include?('=')
+                formatted_labels.push(%(#{k}="#{v}"))
+              else
+                formatted_labels.push(%(#{k}=#{v}))
+              end
             end
             line = formatted_labels.join(' ')
           end
@@ -300,9 +306,11 @@ module Fluent
 
           if @extract_kubernetes_labels && record.key?('kubernetes')
             kubernetes_labels = record['kubernetes']['labels']
-            kubernetes_labels.each_key do |l|
-              new_key = l.gsub(%r{[.\-\/]}, '_')
-              chunk_labels[new_key] = kubernetes_labels[l]
+            if !kubernetes_labels.nil?
+              kubernetes_labels.each_key do |l|
+                new_key = l.gsub(%r{[.\-\/]}, '_')
+                chunk_labels[new_key] = kubernetes_labels[l]
+              end
             end
           end
 

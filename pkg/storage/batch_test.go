@@ -42,7 +42,7 @@ func Test_batchIterSafeStart(t *testing.T) {
 		newLazyChunk(stream),
 	}
 
-	batch := newBatchChunkIterator(context.Background(), chks, 1, logproto.FORWARD, from, from.Add(4*time.Millisecond), NilMetrics, []*labels.Matcher{})
+	batch := newBatchChunkIterator(context.Background(), chks, 1, logproto.FORWARD, from, from.Add(4*time.Millisecond), NilMetrics, []*labels.Matcher{}, nil)
 
 	// if it was started already, we should see a panic before this
 	time.Sleep(time.Millisecond)
@@ -52,11 +52,9 @@ func Test_batchIterSafeStart(t *testing.T) {
 	batch.Start()
 
 	require.NotNil(t, batch.Next())
-
 }
 
 func Test_newLogBatchChunkIterator(t *testing.T) {
-
 	tests := map[string]struct {
 		chunks     []*LazyChunk
 		expected   []logproto.Stream
@@ -946,7 +944,7 @@ func Test_newLogBatchChunkIterator(t *testing.T) {
 	for name, tt := range tests {
 		tt := tt
 		t.Run(name, func(t *testing.T) {
-			it, err := newLogBatchIterator(context.Background(), NilMetrics, tt.chunks, tt.batchSize, newMatchers(tt.matchers), logql.NoopPipeline, tt.direction, tt.start, tt.end)
+			it, err := newLogBatchIterator(context.Background(), NilMetrics, tt.chunks, tt.batchSize, newMatchers(tt.matchers), log.NewNoopPipeline(), tt.direction, tt.start, tt.end, nil)
 			require.NoError(t, err)
 			streams, _, err := iter.ReadBatch(it, 1000)
 			_ = it.Close()
@@ -955,13 +953,11 @@ func Test_newLogBatchChunkIterator(t *testing.T) {
 			}
 
 			assertStream(t, tt.expected, streams.Streams)
-
 		})
 	}
 }
 
 func Test_newSampleBatchChunkIterator(t *testing.T) {
-
 	tests := map[string]struct {
 		chunks     []*LazyChunk
 		expected   []logproto.Series
@@ -1231,7 +1227,10 @@ func Test_newSampleBatchChunkIterator(t *testing.T) {
 	for name, tt := range tests {
 		tt := tt
 		t.Run(name, func(t *testing.T) {
-			it, err := newSampleBatchIterator(context.Background(), NilMetrics, tt.chunks, tt.batchSize, newMatchers(tt.matchers), log.CountExtractor.ToSampleExtractor(nil, false, false), tt.start, tt.end)
+			ex, err := log.NewLineSampleExtractor(log.CountExtractor, nil, nil, false, false)
+			require.NoError(t, err)
+
+			it, err := newSampleBatchIterator(context.Background(), NilMetrics, tt.chunks, tt.batchSize, newMatchers(tt.matchers), ex, tt.start, tt.end, nil)
 			require.NoError(t, err)
 			series, _, err := iter.ReadSampleBatch(it, 1000)
 			_ = it.Close()
@@ -1240,7 +1239,6 @@ func Test_newSampleBatchChunkIterator(t *testing.T) {
 			}
 
 			assertSeries(t, tt.expected, series.Series)
-
 		})
 	}
 }
@@ -1439,9 +1437,9 @@ func TestBuildHeapIterator(t *testing.T) {
 					direction: logproto.FORWARD,
 				},
 				ctx:      ctx,
-				pipeline: logql.NoopPipeline,
+				pipeline: log.NewNoopPipeline(),
 			}
-			it, err := b.buildHeapIterator(tc.input, from, from.Add(6*time.Millisecond), nil)
+			it, err := b.buildHeapIterator(tc.input, from, from.Add(6*time.Millisecond), b.pipeline.ForStream(labels.Labels{labels.Label{Name: "foo", Value: "bar"}}), nil)
 			if err != nil {
 				t.Errorf("buildHeapIterator error = %v", err)
 				return
@@ -1453,48 +1451,6 @@ func TestBuildHeapIterator(t *testing.T) {
 				t.Fatalf("error reading batch %s", err)
 			}
 			assertStream(t, tc.expected, streams.Streams)
-		})
-	}
-}
-
-func TestDropLabels(t *testing.T) {
-
-	for i, tc := range []struct {
-		ls       labels.Labels
-		drop     []string
-		expected labels.Labels
-	}{
-		{
-			ls: labels.Labels{
-				labels.Label{
-					Name:  "a",
-					Value: "1",
-				},
-				labels.Label{
-					Name:  "b",
-					Value: "2",
-				},
-				labels.Label{
-					Name:  "c",
-					Value: "3",
-				},
-			},
-			drop: []string{"b"},
-			expected: labels.Labels{
-				labels.Label{
-					Name:  "a",
-					Value: "1",
-				},
-				labels.Label{
-					Name:  "c",
-					Value: "3",
-				},
-			},
-		},
-	} {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			dropped := dropLabels(tc.ls, tc.drop...)
-			require.Equal(t, tc.expected, dropped)
 		})
 	}
 }
@@ -1530,6 +1486,35 @@ func Test_IsInvalidChunkError(t *testing.T) {
 		result := isInvalidChunkError(tc.err)
 		require.Equal(t, tc.expectedResult, result)
 	}
+}
+
+func TestBatchCancel(t *testing.T) {
+	chunk := func(from time.Time) *LazyChunk {
+		return newLazyChunk(logproto.Stream{
+			Labels: fooLabelsWithName,
+			Entries: []logproto.Entry{
+				{
+					Timestamp: from,
+					Line:      "1",
+				},
+				{
+					Timestamp: from.Add(time.Millisecond),
+					Line:      "2",
+				},
+			},
+		})
+	}
+	chunks := []*LazyChunk{
+		chunk(from), chunk(from.Add(10 * time.Millisecond)), chunk(from.Add(30 * time.Millisecond)),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	it, err := newLogBatchIterator(ctx, NilMetrics, chunks, 1, newMatchers(fooLabels), log.NewNoopPipeline(), logproto.FORWARD, from, time.Now(), nil)
+	require.NoError(t, err)
+	defer require.NoError(t, it.Close())
+	for it.Next() {
+	}
+	require.Equal(t, context.Canceled, it.Error())
 }
 
 var entry logproto.Entry

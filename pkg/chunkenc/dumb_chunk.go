@@ -2,14 +2,13 @@ package chunkenc
 
 import (
 	"context"
+	"io"
 	"sort"
 	"time"
 
-	"github.com/prometheus/prometheus/pkg/labels"
-
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/logql/log"
 )
 
 const (
@@ -68,9 +67,11 @@ func (c *dumbChunk) Utilization() float64 {
 	return float64(len(c.entries)) / float64(tmpNumEntries)
 }
 
+func (c *dumbChunk) Encoding() Encoding { return EncNone }
+
 // Returns an iterator that goes from _most_ recent to _least_ recent (ie,
 // backwards).
-func (c *dumbChunk) Iterator(_ context.Context, from, through time.Time, direction logproto.Direction, _ labels.Labels, _ logql.Pipeline) (iter.EntryIterator, error) {
+func (c *dumbChunk) Iterator(_ context.Context, from, through time.Time, direction logproto.Direction, _ log.StreamPipeline) (iter.EntryIterator, error) {
 	i := sort.Search(len(c.entries), func(i int) bool {
 		return !from.After(c.entries[i].Timestamp)
 	})
@@ -95,13 +96,19 @@ func (c *dumbChunk) Iterator(_ context.Context, from, through time.Time, directi
 	}, nil
 }
 
-func (c *dumbChunk) SampleIterator(_ context.Context, from, through time.Time, _ labels.Labels, _ logql.SampleExtractor) iter.SampleIterator {
+func (c *dumbChunk) SampleIterator(_ context.Context, from, through time.Time, _ log.StreamSampleExtractor) iter.SampleIterator {
 	return nil
 }
 
 func (c *dumbChunk) Bytes() ([]byte, error) {
 	return nil, nil
 }
+
+func (c *dumbChunk) BytesWith(_ []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func (c *dumbChunk) WriteTo(w io.Writer) (int64, error) { return 0, nil }
 
 func (c *dumbChunk) Blocks(_ time.Time, _ time.Time) []Block {
 	return nil

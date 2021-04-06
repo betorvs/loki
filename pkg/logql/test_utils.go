@@ -10,7 +10,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/cortexproject/cortex/pkg/querier/astmapper"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql/parser"
+	promql_parser "github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
@@ -97,7 +97,8 @@ func processStream(in []logproto.Stream, pipeline log.Pipeline) []logproto.Strea
 
 	for _, stream := range in {
 		for _, e := range stream.Entries {
-			if l, out, ok := pipeline.Process([]byte(e.Line), mustParseLabels(stream.Labels)); ok {
+			sp := pipeline.ForStream(mustParseLabels(stream.Labels))
+			if l, out, ok := sp.Process([]byte(e.Line)); ok {
 				var s *logproto.Stream
 				var found bool
 				s, found = resByStream[out.String()]
@@ -124,7 +125,8 @@ func processSeries(in []logproto.Stream, ex log.SampleExtractor) []logproto.Seri
 
 	for _, stream := range in {
 		for _, e := range stream.Entries {
-			if f, lbs, ok := ex.Process([]byte(e.Line), mustParseLabels(stream.Labels)); ok {
+			exs := ex.ForStream(mustParseLabels(stream.Labels))
+			if f, lbs, ok := exs.Process([]byte(e.Line)); ok {
 				var s *logproto.Series
 				var found bool
 				s, found = resBySeries[lbs.String()]
@@ -199,7 +201,7 @@ outer:
 	return iter.NewTimeRangedSampleIterator(
 		iter.NewMultiSeriesIterator(ctx, filtered),
 		req.Start.UnixNano(),
-		req.End.UnixNano(),
+		req.End.UnixNano()+1,
 	), nil
 }
 
@@ -230,7 +232,6 @@ func (m MockDownstreamer) Downstream(ctx context.Context, queries []DownstreamQu
 		results = append(results, res)
 	}
 	return results, nil
-
 }
 
 // create nStreams of nEntries with labelNames each where each label value
@@ -254,7 +255,7 @@ func randomStreams(nStreams, nEntries, nShards int, labelNames []string) (stream
 				Value: fmt.Sprintf("%d", shard),
 			})
 		}
-		for j := 0; j < nEntries; j++ {
+		for j := 0; j <= nEntries; j++ {
 			stream.Entries = append(stream.Entries, logproto.Entry{
 				Timestamp: time.Unix(0, int64(j*int(time.Second))),
 				Line:      fmt.Sprintf("line number: %d", j),
@@ -265,11 +266,10 @@ func randomStreams(nStreams, nEntries, nShards int, labelNames []string) (stream
 		streams = append(streams, stream)
 	}
 	return streams
-
 }
 
 func mustParseLabels(s string) labels.Labels {
-	labels, err := parser.ParseMetric(s)
+	labels, err := promql_parser.ParseMetric(s)
 	if err != nil {
 		logger.Fatalf("Failed to parse %s", s)
 	}

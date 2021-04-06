@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -43,12 +43,9 @@ func TestPipelineWithMissingKey_Tenant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	Debug = true
-	ts := time.Now()
-	entry := testTenantLogLineWithMissingKey
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
+
+	_ = processEntries(pl, newEntry(nil, nil, testTenantLogLineWithMissingKey, time.Now()))
 	expectedLog := "level=debug msg=\"failed to convert value to string\" err=\"Can't convert <nil> to string\" type=null"
 	if !(strings.Contains(buf.String(), expectedLog)) {
 		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
@@ -103,7 +100,7 @@ func TestTenantStage_Validation(t *testing.T) {
 		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
-			stage, err := newTenantStage(util.Logger, testData.config)
+			stage, err := newTenantStage(util_log.Logger, testData.config)
 
 			if testData.expectedErr != nil {
 				assert.EqualError(t, err, *testData.expectedErr)
@@ -173,22 +170,18 @@ func TestTenantStage_Process(t *testing.T) {
 		testData := testData
 
 		t.Run(testName, func(t *testing.T) {
-			stage, err := newTenantStage(util.Logger, testData.config)
+			stage, err := newTenantStage(util_log.Logger, testData.config)
 			require.NoError(t, err)
 
 			// Process and dummy line and ensure nothing has changed except
 			// the tenant reserved label
-			timestamp := time.Unix(1, 1)
-			entry := "hello world"
-			labels := testData.inputLabels.Clone()
-			extracted := testData.inputExtracted
 
-			stage.Process(labels, extracted, &timestamp, &entry)
+			out := processEntries(stage, newEntry(testData.inputExtracted, testData.inputLabels.Clone(), "hello world", time.Unix(1, 1)))[0]
 
-			assert.Equal(t, time.Unix(1, 1), timestamp)
-			assert.Equal(t, "hello world", entry)
+			assert.Equal(t, time.Unix(1, 1), out.Timestamp)
+			assert.Equal(t, "hello world", out.Line)
 
-			actualTenant, ok := labels[client.ReservedLabelTenantID]
+			actualTenant, ok := out.Labels[client.ReservedLabelTenantID]
 			if testData.expectedTenant == nil {
 				assert.False(t, ok)
 			} else {

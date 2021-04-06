@@ -6,13 +6,14 @@ import (
 	"os"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/net/context"
 
@@ -36,7 +37,7 @@ var (
 // TransferChunks receives all chunks from another ingester. The Ingester
 // must be in PENDING state or else the call will fail.
 func (i *Ingester) TransferChunks(stream logproto.Ingester_TransferChunksServer) error {
-	logger := util.WithContext(stream.Context(), util.Logger)
+	logger := util_log.WithContext(stream.Context(), util_log.Logger)
 	// Prevent a shutdown from happening until we've completely finished a handoff
 	// from a leaving ingester.
 	i.shutdownMtx.Lock()
@@ -101,9 +102,9 @@ func (i *Ingester) TransferChunks(stream logproto.Ingester_TransferChunksServer)
 
 		userCtx := user.InjectOrgID(stream.Context(), chunkSet.UserId)
 
-		lbls := []client.LabelAdapter{}
+		lbls := make([]labels.Label, 0, len(chunkSet.Labels))
 		for _, lbl := range chunkSet.Labels {
-			lbls = append(lbls, client.LabelAdapter{Name: lbl.Name, Value: lbl.Value})
+			lbls = append(lbls, labels.Label{Name: lbl.Name, Value: lbl.Value})
 		}
 
 		instance := i.getOrCreateInstance(chunkSet.UserId)
@@ -197,7 +198,7 @@ func (i *Ingester) TransferOut(ctx context.Context) error {
 			return nil
 		}
 
-		level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "transfer failed", "err", err)
+		level.Error(util_log.WithContext(ctx, util_log.Logger)).Log("msg", "transfer failed", "err", err)
 		backoff.Wait()
 	}
 
@@ -205,7 +206,7 @@ func (i *Ingester) TransferOut(ctx context.Context) error {
 }
 
 func (i *Ingester) transferOut(ctx context.Context) error {
-	logger := util.WithContext(ctx, util.Logger)
+	logger := util_log.WithContext(ctx, util_log.Logger)
 	targetIngester, err := i.findTransferTarget(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot find ingester to transfer chunks to: %v", err)
@@ -229,38 +230,52 @@ func (i *Ingester) transferOut(ctx context.Context) error {
 
 	for instanceID, inst := range i.instances {
 		for _, istream := range inst.streams {
-			lbls := []*logproto.LabelPair{}
-			for _, lbl := range istream.labels {
-				lbls = append(lbls, &logproto.LabelPair{Name: lbl.Name, Value: lbl.Value})
-			}
-
-			// We moved to sending one chunk at a time in a stream instead of sending all chunks for a stream
-			// as large chunks can create large payloads of >16MB which can hit GRPC limits,
-			// typically streams won't have many chunks in memory so sending one at a time
-			// shouldn't add too much overhead.
-			for _, c := range istream.chunks {
-				bb, err := c.chunk.Bytes()
-				if err != nil {
-					return err
+			err = func() error {
+				istream.chunkMtx.Lock()
+				defer istream.chunkMtx.Unlock()
+				lbls := []*logproto.LabelPair{}
+				for _, lbl := range istream.labels {
+					lbls = append(lbls, &logproto.LabelPair{Name: lbl.Name, Value: lbl.Value})
 				}
 
-				chunks := make([]*logproto.Chunk, 1)
-				chunks[0] = &logproto.Chunk{
-					Data: bb,
-				}
+				// We moved to sending one chunk at a time in a stream instead of sending all chunks for a stream
+				// as large chunks can create large payloads of >16MB which can hit GRPC limits,
+				// typically streams won't have many chunks in memory so sending one at a time
+				// shouldn't add too much overhead.
+				for _, c := range istream.chunks {
+					// Close the chunk first, writing any data in the headblock to a new block.
+					err := c.chunk.Close()
+					if err != nil {
+						return err
+					}
 
-				err = stream.Send(&logproto.TimeSeriesChunk{
-					Chunks:         chunks,
-					UserId:         instanceID,
-					Labels:         lbls,
-					FromIngesterId: i.lifecycler.ID,
-				})
-				if err != nil {
-					level.Error(logger).Log("msg", "failed sending stream's chunks to ingester", "to_ingester", targetIngester.Addr, "err", err)
-					return err
-				}
+					bb, err := c.chunk.Bytes()
+					if err != nil {
+						return err
+					}
 
-				sentChunks.Add(float64(len(chunks)))
+					chunks := make([]*logproto.Chunk, 1)
+					chunks[0] = &logproto.Chunk{
+						Data: bb,
+					}
+
+					err = stream.Send(&logproto.TimeSeriesChunk{
+						Chunks:         chunks,
+						UserId:         instanceID,
+						Labels:         lbls,
+						FromIngesterId: i.lifecycler.ID,
+					})
+					if err != nil {
+						level.Error(logger).Log("msg", "failed sending stream's chunks to ingester", "to_ingester", targetIngester.Addr, "err", err)
+						return err
+					}
+
+					sentChunks.Add(float64(len(chunks)))
+				}
+				return nil
+			}()
+			if err != nil {
+				return err
 			}
 		}
 	}
@@ -281,7 +296,7 @@ func (i *Ingester) transferOut(ctx context.Context) error {
 
 // findTransferTarget finds an ingester in a PENDING state to use for transferring
 // chunks to.
-func (i *Ingester) findTransferTarget(ctx context.Context) (*ring.IngesterDesc, error) {
+func (i *Ingester) findTransferTarget(ctx context.Context) (*ring.InstanceDesc, error) {
 	ringDesc, err := i.lifecycler.KVStore.Get(ctx, ring.IngesterRingKey)
 	if err != nil {
 		return nil, err

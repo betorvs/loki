@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/common/config"
@@ -39,8 +40,10 @@ var userAgent = fmt.Sprintf("Prometheus/%s", version.Version)
 
 // DefaultSDConfig is the default Docker Swarm SD configuration.
 var DefaultSDConfig = SDConfig{
-	RefreshInterval: model.Duration(60 * time.Second),
-	Port:            80,
+	RefreshInterval:  model.Duration(60 * time.Second),
+	Port:             80,
+	Filters:          []Filter{},
+	HTTPClientConfig: config.DefaultHTTPClientConfig,
 }
 
 func init() {
@@ -51,11 +54,19 @@ func init() {
 type SDConfig struct {
 	HTTPClientConfig config.HTTPClientConfig `yaml:",inline"`
 
-	Host string `yaml:"host"`
-	Role string `yaml:"role"`
-	Port int    `yaml:"port"`
+	Host    string   `yaml:"host"`
+	Role    string   `yaml:"role"`
+	Port    int      `yaml:"port"`
+	Filters []Filter `yaml:"filters"`
 
 	RefreshInterval model.Duration `yaml:"refresh_interval"`
+}
+
+// Filter represent a filter that can be passed to Docker Swarm to reduce the
+// amount of data received.
+type Filter struct {
+	Name   string   `yaml:"name"`
+	Values []string `yaml:"values"`
 }
 
 // Name returns the name of the Config.
@@ -92,16 +103,17 @@ func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	default:
 		return fmt.Errorf("invalid role %s, expected tasks, services, or nodes", c.Role)
 	}
-	return nil
+	return c.HTTPClientConfig.Validate()
 }
 
 // Discovery periodically performs Docker Swarm requests. It implements
 // the Discoverer interface.
 type Discovery struct {
 	*refresh.Discovery
-	client *client.Client
-	role   string
-	port   int
+	client  *client.Client
+	role    string
+	port    int
+	filters filters.Args
 }
 
 // NewDiscovery returns a new Discovery which periodically refreshes its targets.
@@ -121,6 +133,13 @@ func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
 	opts := []client.Opt{
 		client.WithHost(conf.Host),
 		client.WithAPIVersionNegotiation(),
+	}
+
+	d.filters = filters.NewArgs()
+	for _, f := range conf.Filters {
+		for _, v := range f.Values {
+			d.filters.Add(f.Name, v)
+		}
 	}
 
 	// There are other protocols than HTTP supported by the Docker daemon, like

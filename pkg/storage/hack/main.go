@@ -18,12 +18,12 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/local"
 	"github.com/cortexproject/cortex/pkg/chunk/storage"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	cortex_util "github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 
 	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/logql"
 	lstore "github.com/grafana/loki/pkg/storage"
-	"github.com/grafana/loki/pkg/util"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -74,7 +74,7 @@ func getStore() (lstore.Store, error) {
 		&validation.Overrides{},
 		prometheus.DefaultRegisterer,
 		nil,
-		cortex_util.Logger,
+		util_log.Logger,
 	)
 	if err != nil {
 		return nil, err
@@ -84,7 +84,6 @@ func getStore() (lstore.Store, error) {
 }
 
 func fillStore() error {
-
 	store, err := getStore()
 	if err != nil {
 		return err
@@ -100,14 +99,14 @@ func fillStore() error {
 		wgPush.Add(1)
 		go func(j int) {
 			defer wgPush.Done()
-			lbs, err := util.ToClientLabels(fmt.Sprintf("{foo=\"bar\",level=\"%d\"}", j))
+			lbs, err := logql.ParseLabels(fmt.Sprintf("{foo=\"bar\",level=\"%d\"}", j))
 			if err != nil {
 				panic(err)
 			}
-			labelsBuilder := labels.NewBuilder(client.FromLabelAdaptersToLabels(lbs))
+			labelsBuilder := labels.NewBuilder(lbs)
 			labelsBuilder.Set(labels.MetricName, "logs")
 			metric := labelsBuilder.Labels()
-			fp := client.FastFingerprint(lbs)
+			fp := client.Fingerprint(lbs)
 			chunkEnc := chunkenc.NewMemChunk(chunkenc.EncLZ4_4M, 262144, 1572864)
 			for ts := start.UnixNano(); ts < start.UnixNano()+time.Hour.Nanoseconds(); ts = ts + time.Millisecond.Nanoseconds() {
 				entry := &logproto.Entry{
@@ -134,7 +133,6 @@ func fillStore() error {
 					chunkEnc = chunkenc.NewMemChunk(chunkenc.EncLZ4_64k, 262144, 1572864)
 				}
 			}
-
 		}(i)
 
 	}

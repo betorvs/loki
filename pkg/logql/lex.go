@@ -1,36 +1,39 @@
 package logql
 
 import (
-	"strconv"
 	"strings"
 	"text/scanner"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/dustin/go-humanize"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/util/strutil"
 )
 
 var tokens = map[string]int{
-	",":       COMMA,
-	".":       DOT,
-	"{":       OPEN_BRACE,
-	"}":       CLOSE_BRACE,
-	"=":       EQ,
-	OpTypeNEQ: NEQ,
-	"=~":      RE,
-	"!~":      NRE,
-	"|=":      PIPE_EXACT,
-	"|~":      PIPE_MATCH,
-	OpPipe:    PIPE,
-	OpUnwrap:  UNWRAP,
-	"(":       OPEN_PARENTHESIS,
-	")":       CLOSE_PARENTHESIS,
-	"by":      BY,
-	"without": WITHOUT,
-	"bool":    BOOL,
-	"[":       OPEN_BRACKET,
-	"]":       CLOSE_BRACKET,
+	",":            COMMA,
+	".":            DOT,
+	"{":            OPEN_BRACE,
+	"}":            CLOSE_BRACE,
+	"=":            EQ,
+	OpTypeNEQ:      NEQ,
+	"=~":           RE,
+	"!~":           NRE,
+	"|=":           PIPE_EXACT,
+	"|~":           PIPE_MATCH,
+	OpPipe:         PIPE,
+	OpUnwrap:       UNWRAP,
+	"(":            OPEN_PARENTHESIS,
+	")":            CLOSE_PARENTHESIS,
+	"by":           BY,
+	"without":      WITHOUT,
+	"bool":         BOOL,
+	"[":            OPEN_BRACKET,
+	"]":            CLOSE_BRACKET,
+	OpLabelReplace: LABEL_REPLACE,
+	OpOffset:       OFFSET,
 
 	// binops
 	OpTypeOr:     OR,
@@ -53,6 +56,7 @@ var tokens = map[string]int{
 	OpParserTypeJSON:   JSON,
 	OpParserTypeRegexp: REGEXP,
 	OpParserTypeLogfmt: LOGFMT,
+	OpParserTypeUnpack: UNPACK,
 
 	// fmt
 	OpFmtLabel: LABEL_FMT,
@@ -73,33 +77,45 @@ var functionTokens = map[string]int{
 	OpRangeTypeStdvar:    STDVAR_OVER_TIME,
 	OpRangeTypeStddev:    STDDEV_OVER_TIME,
 	OpRangeTypeQuantile:  QUANTILE_OVER_TIME,
+	OpRangeTypeFirst:     FIRST_OVER_TIME,
+	OpRangeTypeLast:      LAST_OVER_TIME,
+	OpRangeTypeAbsent:    ABSENT_OVER_TIME,
 
 	// vec ops
-	OpTypeSum:     SUM,
-	OpTypeAvg:     AVG,
-	OpTypeMax:     MAX,
-	OpTypeMin:     MIN,
-	OpTypeCount:   COUNT,
-	OpTypeStddev:  STDDEV,
-	OpTypeStdvar:  STDVAR,
-	OpTypeBottomK: BOTTOMK,
-	OpTypeTopK:    TOPK,
+	OpTypeSum:      SUM,
+	OpTypeAvg:      AVG,
+	OpTypeMax:      MAX,
+	OpTypeMin:      MIN,
+	OpTypeCount:    COUNT,
+	OpTypeStddev:   STDDEV,
+	OpTypeStdvar:   STDVAR,
+	OpTypeBottomK:  BOTTOMK,
+	OpTypeTopK:     TOPK,
+	OpLabelReplace: LABEL_REPLACE,
 
 	// conversion Op
+	OpConvBytes:           BYTES_CONV,
 	OpConvDuration:        DURATION_CONV,
 	OpConvDurationSeconds: DURATION_SECONDS_CONV,
 }
 
 type lexer struct {
 	scanner.Scanner
-	errs   []ParseError
-	expr   Expr
-	parser *exprParserImpl
+	errs    []ParseError
+	builder strings.Builder
 }
 
 func (l *lexer) Lex(lval *exprSymType) int {
 	r := l.Scan()
+
 	switch r {
+	case '#':
+		// Scan until a newline or EOF is encountered
+		for next := l.Peek(); !(next == '\n' || next == scanner.EOF); next = l.Next() {
+		}
+
+		return l.Lex(lval)
+
 	case scanner.EOF:
 		return 0
 
@@ -123,7 +139,12 @@ func (l *lexer) Lex(lval *exprSymType) int {
 
 	case scanner.String, scanner.RawString:
 		var err error
-		lval.str, err = strconv.Unquote(l.TokenText())
+		tokenText := l.TokenText()
+		if !utf8.ValidString(tokenText) {
+			l.Error("invalid UTF-8 rune")
+			return 0
+		}
+		lval.str, err = strutil.Unquote(tokenText)
 		if err != nil {
 			l.Error(err.Error())
 			return 0
@@ -132,11 +153,11 @@ func (l *lexer) Lex(lval *exprSymType) int {
 	}
 
 	// scanning duration tokens
-	if l.TokenText() == "[" {
-		d := ""
+	if r == '[' {
+		l.builder.Reset()
 		for r := l.Next(); r != scanner.EOF; r = l.Next() {
-			if string(r) == "]" {
-				i, err := model.ParseDuration(d)
+			if r == ']' {
+				i, err := model.ParseDuration(l.builder.String())
 				if err != nil {
 					l.Error(err.Error())
 					return 0
@@ -144,13 +165,15 @@ func (l *lexer) Lex(lval *exprSymType) int {
 				lval.duration = time.Duration(i)
 				return RANGE
 			}
-			d += string(r)
+			_, _ = l.builder.WriteRune(r)
 		}
 		l.Error("missing closing ']' in duration")
 		return 0
 	}
 
-	if tok, ok := functionTokens[l.TokenText()+string(l.Peek())]; ok {
+	tokenText := l.TokenText()
+	tokenNext := tokenText + string(l.Peek())
+	if tok, ok := functionTokens[tokenNext]; ok {
 		// create a copy to advance to the entire token for testing suffix
 		sc := l.Scanner
 		sc.Next()
@@ -160,20 +183,20 @@ func (l *lexer) Lex(lval *exprSymType) int {
 		}
 	}
 
-	if tok, ok := functionTokens[l.TokenText()]; ok && isFunction(l.Scanner) {
+	if tok, ok := functionTokens[tokenText]; ok && isFunction(l.Scanner) {
 		return tok
 	}
 
-	if tok, ok := tokens[l.TokenText()+string(l.Peek())]; ok {
+	if tok, ok := tokens[tokenNext]; ok {
 		l.Next()
 		return tok
 	}
 
-	if tok, ok := tokens[l.TokenText()]; ok {
+	if tok, ok := tokens[tokenText]; ok {
 		return tok
 	}
 
-	lval.str = l.TokenText()
+	lval.str = tokenText
 	return IDENTIFIER
 }
 
@@ -184,7 +207,7 @@ func (l *lexer) Error(msg string) {
 func tryScanDuration(number string, l *scanner.Scanner) (time.Duration, bool) {
 	var sb strings.Builder
 	sb.WriteString(number)
-	//copy the scanner to avoid advancing it in case it's not a duration.
+	// copy the scanner to avoid advancing it in case it's not a duration.
 	s := *l
 	consumed := 0
 	for r := s.Peek(); r != scanner.EOF && !unicode.IsSpace(r); r = s.Peek() {
@@ -224,7 +247,7 @@ func isDurationRune(r rune) bool {
 func tryScanBytes(number string, l *scanner.Scanner) (uint64, bool) {
 	var sb strings.Builder
 	sb.WriteString(number)
-	//copy the scanner to avoid advancing it in case it's not a duration.
+	// copy the scanner to avoid advancing it in case it's not a duration.
 	s := *l
 	consumed := 0
 	for r := s.Peek(); r != scanner.EOF && !unicode.IsSpace(r); r = s.Peek() {
@@ -252,10 +275,10 @@ func tryScanBytes(number string, l *scanner.Scanner) (uint64, bool) {
 }
 
 func isBytesSizeRune(r rune) bool {
-	// B, kB, MB, GB, TB, PB, EB, ZB, YB
-	// KB, KiB, MiB, GiB, TiB, PiB, EiB, ZiB, YiB
+	// Accept: B, kB, MB, GB, TB, PB, KB, KiB, MiB, GiB, TiB, PiB
+	// Do not accept: EB, ZB, YB, PiB, ZiB and YiB. They are not supported since the value migh not be represented in an uint64
 	switch r {
-	case 'B', 'i', 'k', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y':
+	case 'B', 'i', 'k', 'K', 'M', 'G', 'T', 'P':
 		return true
 	default:
 		return false

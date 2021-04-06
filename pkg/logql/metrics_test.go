@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
@@ -28,10 +28,14 @@ func TestQueryType(t *testing.T) {
 		{"bad", "ddd", "", true},
 		{"limited", `{app="foo"}`, QueryTypeLimited, false},
 		{"limited multi label", `{app="foo" ,fuzz=~"foo"}`, QueryTypeLimited, false},
+		{"limited with parser", `{app="foo" ,fuzz=~"foo"} | logfmt`, QueryTypeLimited, false},
 		{"filter", `{app="foo"} |= "foo"`, QueryTypeFilter, false},
+		{"filter string extracted label", `{app="foo"} | json | foo="a"`, QueryTypeFilter, false},
+		{"filter duration", `{app="foo"} | json | duration > 5s`, QueryTypeFilter, false},
 		{"metrics", `rate({app="foo"} |= "foo"[5m])`, QueryTypeMetric, false},
 		{"metrics binary", `rate({app="foo"} |= "foo"[5m]) + count_over_time({app="foo"} |= "foo"[5m]) / rate({app="foo"} |= "foo"[5m]) `, QueryTypeMetric, false},
 		{"filters", `{app="foo"} |= "foo" |= "f" != "b"`, QueryTypeFilter, false},
+		{"filters and labels filters", `{app="foo"} |= "foo" |= "f" != "b" | json | a > 5`, QueryTypeFilter, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -49,7 +53,7 @@ func TestQueryType(t *testing.T) {
 
 func TestLogSlowQuery(t *testing.T) {
 	buf := bytes.NewBufferString("")
-	util.Logger = log.NewLogfmtLogger(buf)
+	util_log.Logger = log.NewLogfmtLogger(buf)
 	tr, c := jaeger.NewTracer("foo", jaeger.NewConstSampler(true), jaeger.NewInMemoryReporter())
 	defer c.Close()
 	opentracing.SetGlobalTracer(tr)
@@ -69,12 +73,12 @@ func TestLogSlowQuery(t *testing.T) {
 			ExecTime:                25.25,
 			TotalBytesProcessed:     100000,
 		},
-	})
+	}, Streams{logproto.Stream{Entries: make([]logproto.Entry, 10)}})
 	require.Equal(t,
 		fmt.Sprintf(
-			"level=info org_id=foo traceID=%s latency=slow query=\"{foo=\\\"bar\\\"} |= \\\"buzz\\\"\" query_type=filter range_type=range length=1h0m0s step=1m0s duration=25.25s status=200 throughput_mb=0.1 total_bytes_mb=0.1\n",
+			"level=info org_id=foo traceID=%s latency=slow query=\"{foo=\\\"bar\\\"} |= \\\"buzz\\\"\" query_type=filter range_type=range length=1h0m0s step=1m0s duration=25.25s status=200 limit=1000 returned_lines=10 throughput=100kB total_bytes=100kB\n",
 			sp.Context().(jaeger.SpanContext).SpanID().String(),
 		),
 		buf.String())
-	util.Logger = log.NewNopLogger()
+	util_log.Logger = log.NewNopLogger()
 }

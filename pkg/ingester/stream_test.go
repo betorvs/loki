@@ -16,7 +16,7 @@ import (
 
 	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/logql/log"
 )
 
 func TestMaxReturnedStreamsErrors(t *testing.T) {
@@ -33,18 +33,20 @@ func TestMaxReturnedStreamsErrors(t *testing.T) {
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.MaxReturnedErrors = tc.limit
 			s := newStream(
-				&Config{MaxReturnedErrors: tc.limit},
+				cfg,
 				model.Fingerprint(0),
 				labels.Labels{
 					{Name: "foo", Value: "bar"},
 				},
-				defaultFactory,
+				NilMetrics,
 			)
 
-			err := s.Push(context.Background(), []logproto.Entry{
+			_, err := s.Push(context.Background(), []logproto.Entry{
 				{Timestamp: time.Unix(int64(numLogs), 0), Line: "log"},
-			}, 0, 0)
+			}, recordPool.GetRecord())
 			require.NoError(t, err)
 
 			newLines := make([]logproto.Entry, numLogs)
@@ -63,7 +65,7 @@ func TestMaxReturnedStreamsErrors(t *testing.T) {
 			fmt.Fprintf(&expected, "total ignored: %d out of %d", numLogs, numLogs)
 			expectErr := httpgrpc.Errorf(http.StatusBadRequest, expected.String())
 
-			err = s.Push(context.Background(), newLines, 0, 0)
+			_, err = s.Push(context.Background(), newLines, recordPool.GetRecord())
 			require.Error(t, err)
 			require.Equal(t, expectErr.Error(), err.Error())
 		})
@@ -72,23 +74,24 @@ func TestMaxReturnedStreamsErrors(t *testing.T) {
 
 func TestPushDeduplication(t *testing.T) {
 	s := newStream(
-		&Config{},
+		defaultConfig(),
 		model.Fingerprint(0),
 		labels.Labels{
 			{Name: "foo", Value: "bar"},
 		},
-		defaultFactory,
+		NilMetrics,
 	)
 
-	err := s.Push(context.Background(), []logproto.Entry{
+	written, err := s.Push(context.Background(), []logproto.Entry{
 		{Timestamp: time.Unix(1, 0), Line: "test"},
 		{Timestamp: time.Unix(1, 0), Line: "test"},
 		{Timestamp: time.Unix(1, 0), Line: "newer, better test"},
-	}, 0, 0)
+	}, recordPool.GetRecord())
 	require.NoError(t, err)
 	require.Len(t, s.chunks, 1)
 	require.Equal(t, s.chunks[0].chunk.Size(), 2,
 		"expected exact duplicate to be dropped and newer content with same timestamp to be appended")
+	require.Equal(t, len("test"+"newer, better test"), written)
 }
 
 func TestStreamIterator(t *testing.T) {
@@ -97,10 +100,9 @@ func TestStreamIterator(t *testing.T) {
 
 	for _, chk := range []struct {
 		name string
-		new  func() chunkenc.Chunk
+		new  func() *chunkenc.MemChunk
 	}{
-		{"dumbChunk", chunkenc.NewDumbChunk},
-		{"gzipChunk", func() chunkenc.Chunk { return chunkenc.NewMemChunk(chunkenc.EncGZIP, 256*1024, 0) }},
+		{"gzipChunk", func() *chunkenc.MemChunk { return chunkenc.NewMemChunk(chunkenc.EncGZIP, 256*1024, 0) }},
 	} {
 		t.Run(chk.name, func(t *testing.T) {
 			var s stream
@@ -120,7 +122,7 @@ func TestStreamIterator(t *testing.T) {
 			for i := 0; i < 100; i++ {
 				from := rand.Intn(chunks*entries - 1)
 				len := rand.Intn(chunks*entries-from) + 1
-				iter, err := s.Iterator(context.TODO(), time.Unix(int64(from), 0), time.Unix(int64(from+len), 0), logproto.FORWARD, logql.NoopPipeline)
+				iter, err := s.Iterator(context.TODO(), nil, time.Unix(int64(from), 0), time.Unix(int64(from+len), 0), logproto.FORWARD, log.NewNoopPipeline().ForStream(s.labels))
 				require.NotNil(t, iter)
 				require.NoError(t, err)
 				testIteratorForward(t, iter, int64(from), int64(from+len))
@@ -130,7 +132,7 @@ func TestStreamIterator(t *testing.T) {
 			for i := 0; i < 100; i++ {
 				from := rand.Intn(entries - 1)
 				len := rand.Intn(chunks*entries-from) + 1
-				iter, err := s.Iterator(context.TODO(), time.Unix(int64(from), 0), time.Unix(int64(from+len), 0), logproto.BACKWARD, logql.NoopPipeline)
+				iter, err := s.Iterator(context.TODO(), nil, time.Unix(int64(from), 0), time.Unix(int64(from+len), 0), logproto.BACKWARD, log.NewNoopPipeline().ForStream(s.labels))
 				require.NotNil(t, iter)
 				require.NoError(t, err)
 				testIteratorBackward(t, iter, int64(from), int64(from+len))
@@ -138,5 +140,32 @@ func TestStreamIterator(t *testing.T) {
 			}
 		})
 	}
+}
 
+func Benchmark_PushStream(b *testing.B) {
+	ls := labels.Labels{
+		labels.Label{Name: "namespace", Value: "loki-dev"},
+		labels.Label{Name: "cluster", Value: "dev-us-central1"},
+		labels.Label{Name: "job", Value: "loki-dev/ingester"},
+		labels.Label{Name: "container", Value: "ingester"},
+	}
+	s := newStream(&Config{}, model.Fingerprint(0), ls, NilMetrics)
+	t, err := newTailer("foo", `{namespace="loki-dev"}`, &fakeTailServer{})
+	require.NoError(b, err)
+
+	go t.loop()
+	defer t.close()
+
+	s.tailers[1] = t
+	ctx := context.Background()
+	e := entries(100, time.Now())
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for n := 0; n < b.N; n++ {
+		rec := recordPool.GetRecord()
+		_, err := s.Push(ctx, e, rec)
+		require.NoError(b, err)
+		recordPool.PutRecord(rec)
+	}
 }

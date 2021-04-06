@@ -10,7 +10,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
 
 	"github.com/go-kit/kit/log/level"
@@ -23,7 +23,7 @@ import (
 	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/logql/log"
 )
 
 func TestTransferOut(t *testing.T) {
@@ -92,10 +92,11 @@ func TestTransferOut(t *testing.T) {
 		for _, stream := range ing2.instances["test"].streams {
 			it, err := stream.Iterator(
 				context.TODO(),
+				nil,
 				time.Unix(0, 0),
 				time.Unix(10, 0),
 				logproto.FORWARD,
-				logql.NoopPipeline,
+				log.NewNoopPipeline().ForStream(stream.labels),
 			)
 			if !assert.NoError(t, err) {
 				continue
@@ -164,7 +165,7 @@ func (f *testIngesterFactory) getIngester(joinAfter time.Duration, t *testing.T)
 		}, nil
 	}
 
-	_, ing := newTestStore(f.t, cfg)
+	_, ing := newTestStore(f.t, cfg, nil)
 	f.ingesters[fmt.Sprintf("%s:0", cfg.LifecyclerConfig.ID)] = ing
 
 	// NB there's some kind of race condition with the in-memory KV client when
@@ -203,7 +204,7 @@ func (c *testIngesterClient) TransferChunks(context.Context, ...grpc.CallOption)
 		c.i.stopIncomingRequests() // used to be called from lifecycler, now it must be called *before* stopping lifecyler. (ingester does this on shutdown)
 		err := services.StopAndAwaitTerminated(context.Background(), c.i.lifecycler)
 		if err != nil {
-			level.Error(util.Logger).Log("msg", "lifecycler failed", "err", err)
+			level.Error(util_log.Logger).Log("msg", "lifecycler failed", "err", err)
 		}
 	}()
 

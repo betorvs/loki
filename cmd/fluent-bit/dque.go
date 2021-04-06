@@ -9,8 +9,11 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/joncrlsn/dque"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
+	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/promtail/api"
 	"github.com/grafana/loki/pkg/promtail/client"
 )
 
@@ -39,10 +42,12 @@ func dqueEntryBuilder() interface{} {
 }
 
 type dqueClient struct {
-	logger log.Logger
-	queue  *dque.DQue
-	loki   client.Client
-	once   sync.Once
+	logger  log.Logger
+	queue   *dque.DQue
+	loki    client.Client
+	once    sync.Once
+	wg      sync.WaitGroup
+	entries chan api.Entry
 }
 
 // New makes a new dque loki client
@@ -67,16 +72,21 @@ func newDque(cfg *config, logger log.Logger) (client.Client, error) {
 		_ = q.queue.TurboOn()
 	}
 
-	q.loki, err = client.New(cfg.clientConfig, logger)
+	q.loki, err = client.New(prometheus.DefaultRegisterer, cfg.clientConfig, logger)
 	if err != nil {
 		return nil, err
 	}
 
+	q.entries = make(chan api.Entry)
+
+	q.wg.Add(2)
+	go q.enqueuer()
 	go q.dequeuer()
 	return q, nil
 }
 
 func (c *dqueClient) dequeuer() {
+	defer c.wg.Done()
 	for {
 		// Dequeue the next item in the queue
 		entry, err := c.queue.DequeueBlock()
@@ -97,23 +107,46 @@ func (c *dqueClient) dequeuer() {
 			continue
 		}
 
-		if err := c.loki.Handle(record.Lbs, record.Ts, record.Line); err != nil {
-			level.Error(c.logger).Log("msg", "error sending record to Loki", "error", err)
+		c.loki.Chan() <- api.Entry{
+			Labels: record.Lbs,
+			Entry: logproto.Entry{
+				Timestamp: record.Ts,
+				Line:      record.Line,
+			},
 		}
 	}
 }
 
 // Stop the client
 func (c *dqueClient) Stop() {
-	c.once.Do(func() { c.queue.Close() })
-	c.loki.Stop()
+	c.once.Do(func() {
+		close(c.entries)
+		c.queue.Close()
+		c.loki.Stop()
+		c.wg.Wait()
+	})
+
 }
 
-// Handle implement EntryHandler; adds a new line to the next batch; send is async.
-func (c *dqueClient) Handle(ls model.LabelSet, t time.Time, s string) error {
-	if err := c.queue.Enqueue(&dqueEntry{ls, t, s}); err != nil {
-		return fmt.Errorf("cannot enqueue record %s: %s", s, err)
-	}
+func (c *dqueClient) Chan() chan<- api.Entry {
+	return c.entries
+}
 
-	return nil
+// Stop the client
+func (c *dqueClient) StopNow() {
+	c.once.Do(func() {
+		close(c.entries)
+		c.queue.Close()
+		c.loki.StopNow()
+		c.wg.Wait()
+	})
+}
+
+func (c *dqueClient) enqueuer() {
+	defer c.wg.Done()
+	for e := range c.entries {
+		if err := c.queue.Enqueue(&dqueEntry{e.Labels, e.Timestamp, e.Line}); err != nil {
+			level.Warn(c.logger).Log("msg", fmt.Sprintf("cannot enqueue record %s:", e.Line), "err", err)
+		}
+	}
 }

@@ -12,12 +12,24 @@
     // flag for tuning things when boltdb-shipper is current or upcoming index type.
     using_boltdb_shipper: true,
 
+    wal_enabled: false,
+
     // flags for running ingesters/queriers as a statefulset instead of deployment type.
     stateful_ingesters: false,
-    ingester_pvc_size: '5Gi',
+    ingester_pvc_size: '10Gi',
+    ingester_pvc_class: 'fast',
 
     stateful_queriers: false,
     querier_pvc_size: '10Gi',
+    querier_pvc_class: 'fast',
+
+    stateful_rulers: false,
+    ruler_pvc_size: '10Gi',
+    ruler_pvc_class: 'fast',
+
+    compactor_pvc_size: '10Gi',
+    compactor_pvc_class: 'fast',
+
 
     annotations: {},
 
@@ -207,15 +219,8 @@
       },
       frontend: {
         compress_responses: true,
-      } + if $._config.queryFrontend.sharded_queries_enabled then {
-        // In process tenant queues on frontends. We divide by the number of frontends;
-        // 2 in this case in order to apply the global limit in aggregate.
-        // This is basically base * shard_factor * query_split_factor / num_frontends where
-        max_outstanding_per_tenant: std.floor(200 * $._config.queryFrontend.shard_factor * $._config.queryFrontend.query_split_factor / $._config.queryFrontend.replicas),
-      }
-      else {
-        max_outstanding_per_tenant: 200,
         log_queries_longer_than: '5s',
+        max_outstanding_per_tenant: if $._config.queryFrontend.sharded_queries_enabled then 1024 else 256,
       },
       frontend_worker: {
         frontend_address: 'query-frontend.%s.svc.cluster.local:9095' % $._config.namespace,
@@ -251,7 +256,11 @@
       limits_config: {
         enforce_metric_name: false,
         // align middleware parallelism with shard factor to optimize one-legged sharded queries.
-        max_query_parallelism: $._config.queryFrontend.shard_factor,
+        max_query_parallelism: if $._config.queryFrontend.sharded_queries_enabled then
+          // For a sharding factor of 16 (default), this is 256, or enough for 16 sharded queries.
+          $._config.queryFrontend.shard_factor * 16
+        else
+          16,  // default to 16x parallelism
         reject_old_samples: true,
         reject_old_samples_max_age: '168h',
         max_query_length: '12000h',  // 500 days

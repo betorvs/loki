@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +30,7 @@ pipeline_stages:
     expression: "^HTTP\\/(?P<protocol_version>[0-9\\.]+)$"
     source:     "protocol"
 `
+
 var testRegexYamlSourceWithMissingKey = `
 pipeline_stages:
 - json:
@@ -49,6 +50,10 @@ var testRegexLogLineWithMissingKey = `
 `
 
 var testRegexLogLine = `11.11.11.11 - frank [25/Jan/2000:14:00:01 -0500] "GET /1986.js HTTP/1.1" 200 932 "-" "Mozilla/5.0 (Windows; U; Windows NT 5.1; de; rv:1.9.1.7) Gecko/20091221 Firefox/3.5.7 GTB6"`
+
+func init() {
+	Debug = true
+}
 
 func TestPipeline_Regex(t *testing.T) {
 	t.Parallel()
@@ -101,17 +106,13 @@ func TestPipeline_Regex(t *testing.T) {
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
-			pl, err := NewPipeline(util.Logger, loadConfig(testData.config), nil, prometheus.DefaultRegisterer)
+			pl, err := NewPipeline(util_log.Logger, loadConfig(testData.config), nil, prometheus.DefaultRegisterer)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			lbls := model.LabelSet{}
-			ts := time.Now()
-			entry := testData.entry
-			extracted := map[string]interface{}{}
-			pl.Process(lbls, extracted, &ts, &entry)
-			assert.Equal(t, testData.expectedExtract, extracted)
+			out := processEntries(pl, newEntry(nil, nil, testData.entry, time.Now()))[0]
+			assert.Equal(t, testData.expectedExtract, out.Extracted)
 		})
 	}
 }
@@ -124,12 +125,8 @@ func TestPipelineWithMissingKey_Regex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
-	Debug = true
-	ts := time.Now()
-	entry := testRegexLogLineWithMissingKey
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
+	_ = processEntries(pl, newEntry(nil, nil, testRegexLogLineWithMissingKey, time.Now()))[0]
+
 	expectedLog := "level=debug component=stage type=regex msg=\"failed to convert source value to string\" source=time err=\"Can't convert <nil> to string\" type=null"
 	if !(strings.Contains(buf.String(), expectedLog)) {
 		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
@@ -225,9 +222,7 @@ func TestRegexConfig_validate(t *testing.T) {
 	}
 }
 
-var (
-	regexLogFixture = `11.11.11.11 - frank [25/Jan/2000:14:00:01 -0500] "GET /1986.js HTTP/1.1" 200 932 "-" "Mozilla/5.0 (Windows; U; Windows NT 5.1; de; rv:1.9.1.7) Gecko/20091221 Firefox/3.5.7 GTB6"`
-)
+var regexLogFixture = `11.11.11.11 - frank [25/Jan/2000:14:00:01 -0500] "GET /1986.js HTTP/1.1" 200 932 "-" "Mozilla/5.0 (Windows; U; Windows NT 5.1; de; rv:1.9.1.7) Gecko/20091221 Firefox/3.5.7 GTB6"`
 
 func TestRegexParser_Parse(t *testing.T) {
 	t.Parallel()
@@ -329,16 +324,12 @@ func TestRegexParser_Parse(t *testing.T) {
 		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
-			p, err := New(util.Logger, nil, StageTypeRegex, tt.config, nil)
+			p, err := New(util_log.Logger, nil, StageTypeRegex, tt.config, nil)
 			if err != nil {
 				t.Fatalf("failed to create regex parser: %s", err)
 			}
-			lbs := model.LabelSet{}
-			extr := tt.extracted
-			ts := time.Now()
-			p.Process(lbs, extr, &ts, &tt.entry)
-			assert.Equal(t, tt.expectedExtract, extr)
-
+			out := processEntries(p, newEntry(tt.extracted, nil, tt.entry, time.Now()))[0]
+			assert.Equal(t, tt.expectedExtract, out.Extracted)
 		})
 	}
 }
@@ -371,17 +362,24 @@ func BenchmarkRegexStage(b *testing.B) {
 	}
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
-			stage, err := New(util.Logger, nil, StageTypeRegex, bm.config, nil)
+			stage, err := New(util_log.Logger, nil, StageTypeRegex, bm.config, nil)
 			if err != nil {
 				panic(err)
 			}
 			labels := model.LabelSet{}
 			ts := time.Now()
 			extr := map[string]interface{}{}
+
+			in := make(chan Entry)
+			out := stage.Run(in)
+			go func() {
+				for range out {
+				}
+			}()
 			for i := 0; i < b.N; i++ {
-				entry := bm.entry
-				stage.Process(labels, extr, &ts, &entry)
+				in <- newEntry(extr, labels, bm.entry, ts)
 			}
+			close(in)
 		})
 	}
 }

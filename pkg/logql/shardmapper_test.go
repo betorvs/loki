@@ -116,7 +116,6 @@ func TestMapSampleExpr(t *testing.T) {
 		t.Run(tc.in.String(), func(t *testing.T) {
 			require.Equal(t, tc.out, m.mapSampleExpr(tc.in, nilMetrics.shardRecorder()))
 		})
-
 	}
 }
 
@@ -141,7 +140,7 @@ func TestMappingStrings(t *testing.T) {
 		},
 		{
 			in:  `max(count(rate({foo="bar"}[5m]))) / 2`,
-			out: `max(sum(downstream<count(rate({foo="bar"}[5m])), shard=0_of_2> ++ downstream<count(rate({foo="bar"}[5m])), shard=1_of_2>)) / 2`,
+			out: `(max(sum(downstream<count(rate({foo="bar"}[5m])), shard=0_of_2> ++ downstream<count(rate({foo="bar"}[5m])), shard=1_of_2>)) / 2)`,
 		},
 		{
 			in:  `topk(3, rate({foo="bar"}[5m]))`,
@@ -175,6 +174,24 @@ func TestMappingStrings(t *testing.T) {
 			in:  `sum by (cluster) (stddev_over_time({foo="bar"} |= "id=123" | logfmt | unwrap latency [5m]))`,
 			out: `sum by (cluster) (stddev_over_time({foo="bar"} |= "id=123" | logfmt | unwrap latency [5m]))`,
 		},
+		{
+			in: `
+		sum without (a) (
+		  label_replace(
+		    sum without (b) (
+		      rate({foo="bar"}[5m])
+		    ),
+		    "baz", "buz", "foo", "(.*)"
+		  )
+		)
+		`,
+			out: `sum without(a)(label_replace(sum without(b)(downstream<sum without(b)(rate({foo="bar"}[5m])),shard=0_of_2>++downstream<sum without(b)(rate({foo="bar"}[5m])),shard=1_of_2>),"baz","buz","foo","(.*)"))`,
+		},
+		{
+			// Ensure we don't try to shard expressions that include label reformatting.
+			in:  `sum(count_over_time({foo="bar"} | logfmt | label_format bar=baz | bar="buz" [5m]))`,
+			out: `sum(count_over_time({foo="bar"} | logfmt | label_format bar=baz | bar="buz" [5m]))`,
+		},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
 			ast, err := ParseExpr(tc.in)
@@ -184,7 +201,6 @@ func TestMappingStrings(t *testing.T) {
 			require.Nil(t, err)
 
 			require.Equal(t, strings.ReplaceAll(tc.out, " ", ""), strings.ReplaceAll(mapped.String(), " ", ""))
-
 		})
 	}
 }

@@ -21,14 +21,12 @@ docker run -v /var/log:/var/log \
 
 You can run Fluent Bit as a [Daemonset](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/) to collect all your Kubernetes workload logs.
 
-To do so you can use our [Fluent Bit helm chart](https://github.com/grafana/loki/tree/master/production/helm/fluent-bit):
-
-> Make sure [tiller](https://helm.sh/docs/install/) is installed correctly in your cluster
+To do so you can use our [Fluent Bit helm chart](https://github.com/grafana/helm-charts/tree/main/charts/fluent-bit):
 
 ```bash
-helm repo add loki https://grafana.github.io/loki/charts
+helm repo add grafana https://grafana.github.io/helm-charts
 helm repo update
-helm upgrade --install fluent-bit loki/fluent-bit \
+helm upgrade --install fluent-bit grafana/fluent-bit \
     --set loki.serviceName=loki.svc.cluster.local
 ```
 
@@ -37,7 +35,7 @@ By default it will collect all containers logs and extract labels from Kubernete
 Alternatively you can install the Loki and Fluent Bit all together using:
 
 ```bash
-helm upgrade --install loki-stack loki/loki-stack \
+helm upgrade --install loki-stack grafana/loki-stack \
     --set fluent-bit.enabled=true,promtail.enabled=false
 ```
 
@@ -48,19 +46,19 @@ For more information about this see our [AWS documentation](../aws/ecs)
 
 ### Local
 
-First you need to follow those [instructions](https://github.com/grafana/loki/blob/master/cmd/fluent-bit/README) to build the plugin dynamic library.
+First, you need to follow the [instructions](https://github.com/grafana/loki/blob/master/cmd/fluent-bit/README.md) in order to build the plugin dynamic library.
 
 The assuming you have Fluent Bit installed in your `$PATH` you can run the plugin using:
 
 ```bash
-fluent-bit -e /path/to/built/out_loki.so -c fluent-bit.conf
+fluent-bit -e /path/to/built/out_grafana_loki.so -c fluent-bit.conf
 ```
 
 You can also adapt your plugins.conf, removing the need to change the command line options:
 
 ```conf
 [PLUGINS]
-    Path /path/to/built/out_loki.so
+    Path /path/to/built/out_grafana_loki.so
 ```
 
 ## Configuration Options
@@ -155,7 +153,7 @@ Loki output plugin has buffering mechanism based on [`dque`](https://github.com/
 
 ```properties
 [Output]
-    Name loki
+    Name grafana-loki
     Match *
     Url http://localhost:3100/loki/api/v1/push
     Buffer true
@@ -170,7 +168,7 @@ To configure the Loki output plugin add this section to fluent-bit.conf
 
 ```properties
 [Output]
-    Name loki
+    Name grafana-loki
     Match *
     Url http://localhost:3100/loki/api/v1/push
     BatchWait 1s
@@ -184,7 +182,7 @@ To configure the Loki output plugin add this section to fluent-bit.conf
 
 ```properties
 [Output]
-    Name loki
+    Name grafana-loki
     Match *
     Url http://localhost:3100/loki/api/v1/push
     BatchWait 1s

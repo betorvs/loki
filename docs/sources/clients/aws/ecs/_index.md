@@ -130,7 +130,7 @@ The `log_router` container image is the [Fluent bit Loki docker image][fluentbit
     ],
     "entryPoint": ["sh","-c"],
     "essential": true,
-    "image": "alpine:3.12",
+    "image": "alpine:3.13",
     "logConfiguration": {
         "logDriver": "awsfirelens",
         "options": {
@@ -154,7 +154,7 @@ All `options` of the `logConfiguration` will be automatically translated into [f
 
 ```conf
 [OUTPUT]
-    Name loki
+    Name grafana-loki
     Match awsfirelens*
     Url https://<userid>:<grafancloud apikey>@logs-prod-us-central1.grafana.net/loki/api/v1/push
     Labels {job="firelens"}

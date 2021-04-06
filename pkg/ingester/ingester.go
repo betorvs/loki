@@ -2,25 +2,26 @@ package ingester
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
+	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/grafana/loki/pkg/storage"
-
+	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc/health/grpc_health_v1"
-
-	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/ring"
-	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/services"
 
 	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/helpers"
@@ -29,8 +30,11 @@ import (
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/logql/stats"
+	"github.com/grafana/loki/pkg/storage"
 	"github.com/grafana/loki/pkg/storage/stores/shipper"
+	errUtil "github.com/grafana/loki/pkg/util"
 	listutil "github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/pkg/util/runtime"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -50,15 +54,16 @@ type Config struct {
 	// Config for transferring chunks.
 	MaxTransferRetries int `yaml:"max_transfer_retries,omitempty"`
 
-	ConcurrentFlushes int           `yaml:"concurrent_flushes"`
-	FlushCheckPeriod  time.Duration `yaml:"flush_check_period"`
-	FlushOpTimeout    time.Duration `yaml:"flush_op_timeout"`
-	RetainPeriod      time.Duration `yaml:"chunk_retain_period"`
-	MaxChunkIdle      time.Duration `yaml:"chunk_idle_period"`
-	BlockSize         int           `yaml:"chunk_block_size"`
-	TargetChunkSize   int           `yaml:"chunk_target_size"`
-	ChunkEncoding     string        `yaml:"chunk_encoding"`
-	MaxChunkAge       time.Duration `yaml:"max_chunk_age"`
+	ConcurrentFlushes int               `yaml:"concurrent_flushes"`
+	FlushCheckPeriod  time.Duration     `yaml:"flush_check_period"`
+	FlushOpTimeout    time.Duration     `yaml:"flush_op_timeout"`
+	RetainPeriod      time.Duration     `yaml:"chunk_retain_period"`
+	MaxChunkIdle      time.Duration     `yaml:"chunk_idle_period"`
+	BlockSize         int               `yaml:"chunk_block_size"`
+	TargetChunkSize   int               `yaml:"chunk_target_size"`
+	ChunkEncoding     string            `yaml:"chunk_encoding"`
+	parsedEncoding    chunkenc.Encoding `yaml:"-"` // placeholder for validated encoding
+	MaxChunkAge       time.Duration     `yaml:"max_chunk_age"`
 
 	// Synchronization settings. Used to make sure that ingesters cut their chunks at the same moments.
 	SyncPeriod         time.Duration `yaml:"sync_period"`
@@ -71,11 +76,14 @@ type Config struct {
 
 	QueryStore                  bool          `yaml:"-"`
 	QueryStoreMaxLookBackPeriod time.Duration `yaml:"query_store_max_look_back_period"`
+
+	WAL WALConfig `yaml:"wal,omitempty"`
 }
 
 // RegisterFlags registers the flags.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
+	cfg.WAL.RegisterFlags(f)
 
 	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing. If set to 0 or negative value, transfers are disabled.")
 	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 16, "")
@@ -93,12 +101,30 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.QueryStoreMaxLookBackPeriod, "ingester.query-store-max-look-back-period", 0, "How far back should an ingester be allowed to query the store for data, for use only with boltdb-shipper index and filesystem object store. -1 for infinite.")
 }
 
+func (cfg *Config) Validate() error {
+	enc, err := chunkenc.ParseEncoding(cfg.ChunkEncoding)
+	if err != nil {
+		return err
+	}
+	cfg.parsedEncoding = enc
+
+	if err = cfg.WAL.Validate(); err != nil {
+		return err
+	}
+
+	if cfg.MaxTransferRetries > 0 && cfg.WAL.Enabled {
+		return errors.New("the use of the write ahead log (WAL) is incompatible with chunk transfers. It's suggested to use the WAL. Please try setting ingester.max-transfer-retries to 0 to disable transfers")
+	}
+	return nil
+}
+
 // Ingester builds chunks for incoming log streams.
 type Ingester struct {
 	services.Service
 
-	cfg          Config
-	clientConfig client.Config
+	cfg           Config
+	clientConfig  client.Config
+	tenantConfigs *runtime.TenantConfigs
 
 	shutdownMtx  sync.Mutex // Allows processes to grab a lock and prevent a shutdown
 	instancesMtx sync.RWMutex
@@ -121,7 +147,17 @@ type Ingester struct {
 	flushQueuesDone sync.WaitGroup
 
 	limiter *Limiter
-	factory func() chunkenc.Chunk
+
+	// Denotes whether the ingester should flush on shutdown.
+	// Currently only used by the WAL to signal when the disk is full.
+	flushOnShutdownSwitch *OnceSwitch
+
+	// Only used by WAL & flusher to coordinate backpressure during replay.
+	replayController *replayController
+
+	metrics *ingesterMetrics
+
+	wal WAL
 }
 
 // ChunkStore is the interface we need to store chunks.
@@ -134,30 +170,41 @@ type ChunkStore interface {
 }
 
 // New makes a new Ingester.
-func New(cfg Config, clientConfig client.Config, store ChunkStore, limits *validation.Overrides, registerer prometheus.Registerer) (*Ingester, error) {
+func New(cfg Config, clientConfig client.Config, store ChunkStore, limits *validation.Overrides, configs *runtime.TenantConfigs, registerer prometheus.Registerer) (*Ingester, error) {
 	if cfg.ingesterClientFactory == nil {
 		cfg.ingesterClientFactory = client.New
 	}
-	enc, err := chunkenc.ParseEncoding(cfg.ChunkEncoding)
+
+	metrics := newIngesterMetrics(registerer)
+
+	i := &Ingester{
+		cfg:                   cfg,
+		clientConfig:          clientConfig,
+		tenantConfigs:         configs,
+		instances:             map[string]*instance{},
+		store:                 store,
+		periodicConfigs:       store.GetSchemaConfigs(),
+		loopQuit:              make(chan struct{}),
+		flushQueues:           make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		tailersQuit:           make(chan struct{}),
+		metrics:               metrics,
+		flushOnShutdownSwitch: &OnceSwitch{},
+	}
+	i.replayController = newReplayController(metrics, cfg.WAL, &replayFlusher{i})
+
+	if cfg.WAL.Enabled {
+		if err := os.MkdirAll(cfg.WAL.Dir, os.ModePerm); err != nil {
+			return nil, err
+		}
+	}
+
+	wal, err := newWAL(cfg.WAL, registerer, metrics, newIngesterSeriesIter(i))
 	if err != nil {
 		return nil, err
 	}
+	i.wal = wal
 
-	i := &Ingester{
-		cfg:             cfg,
-		clientConfig:    clientConfig,
-		instances:       map[string]*instance{},
-		store:           store,
-		periodicConfigs: store.GetSchemaConfigs(),
-		loopQuit:        make(chan struct{}),
-		flushQueues:     make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
-		tailersQuit:     make(chan struct{}),
-		factory: func() chunkenc.Chunk {
-			return chunkenc.NewMemChunk(enc, cfg.BlockSize, cfg.TargetChunkSize)
-		},
-	}
-
-	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", ring.IngesterRingKey, true, registerer)
+	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", ring.IngesterRingKey, !cfg.WAL.Enabled || cfg.WAL.FlushOnShutdown, registerer)
 	if err != nil {
 		return nil, err
 	}
@@ -174,11 +221,75 @@ func New(cfg Config, clientConfig client.Config, store ChunkStore, limits *valid
 }
 
 func (i *Ingester) starting(ctx context.Context) error {
-	i.flushQueuesDone.Add(i.cfg.ConcurrentFlushes)
-	for j := 0; j < i.cfg.ConcurrentFlushes; j++ {
-		i.flushQueues[j] = util.NewPriorityQueue(flushQueueLength)
-		go i.flushLoop(j)
+	if i.cfg.WAL.Enabled {
+		// Ignore retain period during wal replay.
+		old := i.cfg.RetainPeriod
+		i.cfg.RetainPeriod = 0
+		defer func() {
+			i.cfg.RetainPeriod = old
+		}()
+
+		// Disable the in process stream limit checks while replaying the WAL
+		i.limiter.Disable()
+		defer i.limiter.Enable()
+
+		recoverer := newIngesterRecoverer(i)
+		defer recoverer.Close()
+
+		start := time.Now()
+
+		level.Info(util_log.Logger).Log("msg", "recovering from checkpoint")
+		checkpointReader, checkpointCloser, err := newCheckpointReader(i.cfg.WAL.Dir)
+		if err != nil {
+			return err
+		}
+		defer checkpointCloser.Close()
+
+		checkpointRecoveryErr := RecoverCheckpoint(checkpointReader, recoverer)
+		if checkpointRecoveryErr != nil {
+			i.metrics.walCorruptionsTotal.WithLabelValues(walTypeCheckpoint).Inc()
+			level.Error(util_log.Logger).Log(
+				"msg",
+				`Recovered from checkpoint with errors. Some streams were likely not recovered due to WAL checkpoint file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.`,
+				"elapsed", time.Since(start).String(),
+			)
+		}
+		level.Info(util_log.Logger).Log(
+			"msg", "recovered WAL checkpoint recovery finished",
+			"elapsed", time.Since(start).String(),
+			"errors", checkpointRecoveryErr != nil,
+		)
+
+		level.Info(util_log.Logger).Log("msg", "recovering from WAL")
+		segmentReader, segmentCloser, err := newWalReader(i.cfg.WAL.Dir, -1)
+		if err != nil {
+			return err
+		}
+		defer segmentCloser.Close()
+
+		segmentRecoveryErr := RecoverWAL(segmentReader, recoverer)
+		if segmentRecoveryErr != nil {
+			i.metrics.walCorruptionsTotal.WithLabelValues(walTypeSegment).Inc()
+			level.Error(util_log.Logger).Log(
+				"msg",
+				"Recovered from WAL segments with errors. Some streams and/or entries were likely not recovered due to WAL segment file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.",
+				"elapsed", time.Since(start).String(),
+			)
+		}
+		level.Info(util_log.Logger).Log(
+			"msg", "WAL segment recovery finished",
+			"elapsed", time.Since(start).String(),
+			"errors", segmentRecoveryErr != nil,
+		)
+
+		elapsed := time.Since(start)
+		i.metrics.walReplayDuration.Set(elapsed.Seconds())
+		level.Info(util_log.Logger).Log("msg", "recovery finished", "time", elapsed.String())
+
+		i.wal.Start()
 	}
+
+	i.InitFlushQueues()
 
 	// pass new context to lifecycler, so that it doesn't stop automatically when Ingester's service context is done
 	err := i.lifecycler.StartAsync(context.Background())
@@ -222,8 +333,13 @@ func (i *Ingester) running(ctx context.Context) error {
 // At this point, loop no longer runs, but flushers are still running.
 func (i *Ingester) stopping(_ error) error {
 	i.stopIncomingRequests()
+	var errs errUtil.MultiError
+	errs.Add(i.wal.Stop())
 
-	err := services.StopAndAwaitTerminated(context.Background(), i.lifecycler)
+	if i.flushOnShutdownSwitch.Get() {
+		i.lifecycler.SetFlushOnShutdown(true)
+	}
+	errs.Add(services.StopAndAwaitTerminated(context.Background(), i.lifecycler))
 
 	// Normally, flushers are stopped via lifecycler (in transferOut), but if lifecycler fails,
 	// we better stop them.
@@ -232,7 +348,7 @@ func (i *Ingester) stopping(_ error) error {
 	}
 	i.flushQueuesDone.Wait()
 
-	return err
+	return errs.Err()
 }
 
 func (i *Ingester) loop() {
@@ -244,12 +360,24 @@ func (i *Ingester) loop() {
 	for {
 		select {
 		case <-flushTicker.C:
-			i.sweepUsers(false)
+			i.sweepUsers(false, true)
 
 		case <-i.loopQuit:
 			return
 		}
 	}
+}
+
+// ShutdownHandler triggers the following set of operations in order:
+//     * Change the state of ring to stop accepting writes.
+//     * Flush all the chunks.
+func (i *Ingester) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
+	originalState := i.lifecycler.FlushOnShutdown()
+	// We want to flush the chunks if transfer fails irrespective of original flag.
+	i.lifecycler.SetFlushOnShutdown(true)
+	_ = services.StopAndAwaitTerminated(context.Background(), i)
+	i.lifecycler.SetFlushOnShutdown(originalState)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Push implements logproto.Pusher.
@@ -276,7 +404,7 @@ func (i *Ingester) getOrCreateInstance(instanceID string) *instance {
 	defer i.instancesMtx.Unlock()
 	inst, ok = i.instances[instanceID]
 	if !ok {
-		inst = newInstance(&i.cfg, instanceID, i.factory, i.limiter, i.cfg.SyncPeriod, i.cfg.SyncMinUtilization)
+		inst = newInstance(&i.cfg, instanceID, i.limiter, i.tenantConfigs, i.wal, i.metrics, i.flushOnShutdownSwitch)
 		i.instances[instanceID] = inst
 	}
 	return inst
@@ -320,7 +448,7 @@ func (i *Ingester) Query(req *logproto.QueryRequest, queryServer logproto.Querie
 
 	defer helpers.LogErrorWithContext(ctx, "closing iterator", heapItr.Close)
 
-	return sendBatches(queryServer.Context(), heapItr, queryServer, req.Limit)
+	return sendBatches(ctx, heapItr, queryServer, req.Limit)
 }
 
 // QuerySample the ingesters for series from logs matching a set of matchers.
@@ -359,7 +487,7 @@ func (i *Ingester) QuerySample(req *logproto.SampleQueryRequest, queryServer log
 
 	defer helpers.LogErrorWithContext(ctx, "closing iterator", heapItr.Close)
 
-	return sendSampleBatches(queryServer.Context(), heapItr, queryServer)
+	return sendSampleBatches(ctx, heapItr, queryServer)
 }
 
 // boltdbShipperMaxLookBack returns a max look back period only if active index type is boltdb-shipper.
@@ -390,7 +518,7 @@ func (i *Ingester) GetChunkIDs(ctx context.Context, req *logproto.GetChunkIDsReq
 
 	boltdbShipperMaxLookBack := i.boltdbShipperMaxLookBack()
 	if boltdbShipperMaxLookBack == 0 {
-		return nil, nil
+		return &logproto.GetChunkIDsResponse{}, nil
 	}
 
 	reqStart := req.Start
@@ -549,7 +677,9 @@ func (i *Ingester) Tail(req *logproto.TailRequest, queryServer logproto.Querier_
 		return err
 	}
 
-	instance.addNewTailer(tailer)
+	if err := instance.addNewTailer(tailer); err != nil {
+		return err
+	}
 	tailer.loop()
 	return nil
 }

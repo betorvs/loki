@@ -10,10 +10,10 @@ and how to scrape logs from files.
 - [Configuring Promtail](#configuring-promtail)
   - [Printing Promtail Config At Runtime](#printing-promtail-config-at-runtime)
   - [Configuration File Reference](#configuration-file-reference)
-  - [server_config](#server_config)
-  - [client_config](#client_config)
-  - [position_config](#position_config)
-  - [scrape_config](#scrape_config)
+  - [server](#server)
+  - [clients](#clients)
+  - [positions](#positions)
+  - [scrape_configs](#scrape_configs)
     - [pipeline_stages](#pipeline_stages)
       - [docker](#docker)
       - [cri](#cri)
@@ -29,12 +29,13 @@ and how to scrape logs from files.
         - [gauge](#gauge)
         - [histogram](#histogram)
       - [tenant](#tenant)
-    - [journal_config](#journal_config)
-    - [syslog_config](#syslog_config)
+    - [journal](#journal)
+    - [syslog](#syslog)
       - [Available Labels](#available-labels)
-    - [loki_push_api_config](#loki_push_api_config)
-    - [relabel_config](#relabel_config)
-    - [static_config](#static_config)
+    - [loki_push_api](#loki_push_api)
+    - [windows_events](#windows_events)
+    - [relabel_configs](#relabel_configs)
+    - [static_configs](#static_configs)
     - [file_sd_config](#file_sd_config)
     - [kubernetes_sd_config](#kubernetes_sd_config)
       - [`node`](#node)
@@ -80,7 +81,30 @@ For more detailed information on configuring how to discover and scrape logs fro
 targets, see [Scraping](../scraping/). For more information on transforming logs
 from scraped targets, see [Pipelines](../pipelines/).
 
-Generic placeholders are defined as follows:
+### Use environment variables in the configuration
+
+You can use environment variable references in the configuration file to set values that need to be configurable during deployment.
+To do this, pass `-config.expand-env=true` and use:
+
+```
+${VAR}
+```
+
+Where VAR is the name of the environment variable.
+
+Each variable reference is replaced at startup by the value of the environment variable.
+The replacement is case-sensitive and occurs before the YAML file is parsed.
+References to undefined variables are replaced by empty strings unless you specify a default value or custom error text.
+
+To specify a default value, use:
+
+```
+${VAR:default_value}
+```
+
+Where default_value is the value to use if the environment variable is undefined.
+
+### Generic placeholders:
 
 - `<boolean>`: a boolean that can take the values `true` or `false`
 - `<int>`: any integer matching the regular expression `[1-9]+[0-9]*`
@@ -93,7 +117,7 @@ Generic placeholders are defined as follows:
 - `<string>`: a regular string
 - `<secret>`: a regular string that is a secret, such as a password
 
-Supported contents and default values of `config.yaml`:
+### Supported contents and default values of `config.yaml`:
 
 ```yaml
 # Configures the server for Promtail.
@@ -119,9 +143,9 @@ scrape_configs:
 [target_config: <target_config>]
 ```
 
-## server_config
+## server
 
-The `server_config` block configures Promtail's behavior as an HTTP server:
+The `server` block configures Promtail's behavior as an HTTP server:
 
 ```yaml
 # Disable the HTTP and GRPC server.
@@ -174,9 +198,9 @@ The `server_config` block configures Promtail's behavior as an HTTP server:
 [health_check_target: <bool> | default = true]
 ```
 
-## client_config
+## clients
 
-The `client_config` block configures how Promtail connects to an instance of
+The `clients` block configures how Promtail connects to an instance of
 Loki:
 
 ```yaml
@@ -273,9 +297,9 @@ external_labels:
 [timeout: <duration> | default = 10s]
 ```
 
-## position_config
+## positions
 
-The `position_config` block configures where Promtail will save a file
+The `positions` block configures where Promtail will save a file
 indicating how far it has read into a file. It is needed for when Promtail
 is restarted to allow it to continue from where it left off.
 
@@ -290,9 +314,9 @@ is restarted to allow it to continue from where it left off.
 [ignore_invalid_yaml: <boolean> | default = false]
 ```
 
-## scrape_config
+## scrape_configs
 
-The `scrape_config` block configures how Promtail can scrape logs from a series
+The `scrape_configs` block configures how Promtail can scrape logs from a series
 of targets using a specified discovery method:
 
 ```yaml
@@ -527,7 +551,7 @@ timestamp:
   [location: <string>]
 ```
 
-##### output
+#### output
 
 The output stage takes data from the extracted map and sets the contents of the
 log entry that will be stored by Loki.
@@ -675,9 +699,9 @@ tenant:
   [ value: <string> ]
 ```
 
-### journal_config
+### journal
 
-The `journal_config` block configures reading from the systemd journal from
+The `journal` block configures reading from the systemd journal from
 Promtail. Requires a build of Promtail that has journal support _enabled_. If
 using the AMD64 Docker image, this is enabled by default.
 
@@ -703,9 +727,9 @@ labels:
 
 **Note**: priority label is available as both value and keyword. For example, if `priority` is `3` then the labels will be `__journal_priority` with a value `3` and `__journal_priority_keyword` with a corresponding keyword `err`.
 
-### syslog_config
+### syslog
 
-The `syslog_config` block configures a syslog listener allowing users to push
+The `syslog` block configures a syslog listener allowing users to push
 logs to promtail with the syslog protocol.
 Currently supported is [IETF Syslog (RFC5424)](https://tools.ietf.org/html/rfc5424)
 with and without octet counting.
@@ -742,6 +766,14 @@ label_structured_data: <bool>
 # Label map to add to every log message.
 labels:
   [ <labelname>: <labelvalue> ... ]
+
+# Whether promtail should pass on the timestamp from the incoming syslog message.
+# When false, or if no timestamp is present on the syslog message, Promtail will assign the current timestamp to the log when it was processed.
+# Default is false
+use_incoming_timestamp: <bool>
+
+# Sets the maximum limit to the length of syslog messages
+max_message_length: <int>
 ```
 
 #### Available Labels
@@ -756,13 +788,13 @@ labels:
 - `__syslog_message_msg_id`: The [msgid field](https://tools.ietf.org/html/rfc5424#section-6.2.7) parsed from the message.
 - `__syslog_message_sd_<sd_id>[_<iana_enterprise_id>]_<sd_name>`: The [structured-data field](https://tools.ietf.org/html/rfc5424#section-6.3) parsed from the message. The data field `[custom@99770 example="1"]` becomes `__syslog_message_sd_custom_99770_example`.
 
-### loki_push_api_config
+### loki_push_api
 
-The `loki_push_api_config` block configures Promtail to expose a [Loki push API](../../../api#post-lokiapiv1push) server.
+The `loki_push_api` block configures Promtail to expose a [Loki push API](../../../api#post-lokiapiv1push) server.
 
-Each job configured with a `loki_push_api_config` will expose this API and will require a separate port.
+Each job configured with a `loki_push_api` will expose this API and will require a separate port.
 
-Note the `server` configuration is the same as [server_config](#server_config)
+Note the `server` configuration is the same as [server](#server)
 
 
 
@@ -781,7 +813,68 @@ labels:
 
 See [Example Push Config](#example-push-config)
 
-### relabel_config
+
+### windows_events
+
+The `windows_events` block configures Promtail to scrape windows event logs and send them to Loki.
+
+To subcribe to a specific events stream you need to provide either an `eventlog_name` or an `xpath_query`.
+
+Events are scraped periodically every 3 seconds by default but can be changed using `poll_interval`.
+
+A bookmark path `bookmark_path` is mandatory and will be used as a position file where Promtail will
+keep record of the last event processed. This file persists across promtail restarts.
+
+You can set `use_incoming_timestamp` if you want to keep incomming event timestamps. By default Promtail will use the timestamp when
+the event was read from the event log.
+
+Promtail will serialize JSON windows events, adding `channel` and `computer` labels from the event received.
+You can add additional labels with the `labels` property.
+
+
+```yaml
+# LCID (Locale ID) for event rendering
+# - 1033 to force English language
+# -  0 to use default Windows locale
+[locale: <int> | default = 0]
+
+# Name of eventlog, used only if xpath_query is empty
+# Example: "Application"
+[eventlog_name: <string> | default = ""]
+
+# xpath_query can be in defined short form like "Event/System[EventID=999]"
+# or you can form a XML Query. Refer to the Consuming Events article:
+# https://docs.microsoft.com/en-us/windows/win32/wes/consuming-events
+# XML query is the recommended form, because it is most flexible
+# You can create or debug XML Query by creating Custom View in Windows Event Viewer
+# and then copying resulting XML here
+[xpath_query: <string> | default = "*"]
+
+# Sets the bookmark location on the filesystem.
+# The bookmark contains the current position of the target in XML.
+# When restarting or rolling out promtail, the target will continue to scrape events where it left off based on the bookmark position.
+# The position is updated after each entry processed.
+[bookmark_path: <string> | default = ""]
+
+# PollInterval is the interval at which we're looking if new events are available. By default the target will check every 3seconds.
+[poll_interval: <duration> | default = 3s]
+
+# Allows to exclude the xml event data.
+[exclude_event_data: <bool> | default = false]
+
+# Allows to exclude the user data of each windows event.
+[exclude_event_data: <bool> | default = false]
+
+# Label map to add to every log line sent to the push API
+labels:
+  [ <labelname>: <labelvalue> ... ]
+
+# If promtail should pass on the timestamp from the incoming log or not.
+# When false promtail will assign the current timestamp to the log when it was processed
+[use_incoming_timestamp: <bool> | default = false]
+```
+
+### relabel_configs
 
 Relabeling is a powerful tool to dynamically rewrite the label set of a target
 before it gets scraped. Multiple relabeling steps can be configured per scrape
@@ -858,9 +951,9 @@ use `.*<regex>.*`.
 Care must be taken with `labeldrop` and `labelkeep` to ensure that logs are
 still uniquely labeled once the labels are removed.
 
-### static_config
+### static_configs
 
-A `static_config` allows specifying a list of targets and a common label set
+A `static_configs` allows specifying a list of targets and a common label set
 for them.  It is the canonical way to specify static targets in a scrape
 configuration.
 
@@ -1118,7 +1211,7 @@ sync_period: "10s"
 
 It's fairly difficult to tail Docker files on a standalone machine because they are in different locations for every OS.  We recommend the [Docker logging driver](../../docker-driver/) for local Docker installs or Docker Compose.
 
-If running in a Kubernetes environment, you should look at the defined configs which are in [helm](https://github.com/grafana/loki/tree/master/production/helm/promtail/templates/configmap.yaml) and [jsonnet](https://github.com/grafana/loki/tree/master/production/ksonnet/promtail/scrape_config.libsonnet), these leverage the prometheus service discovery libraries (and give promtail it's name) for automatically finding and tailing pods.  The jsonnet config explains with comments what each section is for.
+If running in a Kubernetes environment, you should look at the defined configs which are in [helm](https://github.com/grafana/helm-charts/blob/main/charts/promtail/templates/configmap.yaml) and [jsonnet](https://github.com/grafana/loki/tree/master/production/ksonnet/promtail/scrape_config.libsonnet), these leverage the prometheus service discovery libraries (and give promtail it's name) for automatically finding and tailing pods.  The jsonnet config explains with comments what each section is for.
 
 
 ## Example Static Config

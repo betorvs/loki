@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -43,20 +43,17 @@ var testLabelsLogLineWithMissingKey = `
 `
 
 func TestLabelsPipeline_Labels(t *testing.T) {
-	pl, err := NewPipeline(util.Logger, loadConfig(testLabelsYaml), nil, prometheus.DefaultRegisterer)
+	pl, err := NewPipeline(util_log.Logger, loadConfig(testLabelsYaml), nil, prometheus.DefaultRegisterer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	expectedLbls := model.LabelSet{
 		"level": "WARN",
 		"app":   "loki",
 	}
-	ts := time.Now()
-	entry := testLabelsLogLine
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
-	assert.Equal(t, expectedLbls, lbls)
+
+	out := processEntries(pl, newEntry(nil, nil, testLabelsLogLine, time.Now()))[0]
+	assert.Equal(t, expectedLbls, out.Labels)
 }
 
 func TestLabelsPipelineWithMissingKey_Labels(t *testing.T) {
@@ -67,12 +64,10 @@ func TestLabelsPipelineWithMissingKey_Labels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lbls := model.LabelSet{}
 	Debug = true
-	ts := time.Now()
-	entry := testLabelsLogLineWithMissingKey
-	extracted := map[string]interface{}{}
-	pl.Process(lbls, extracted, &ts, &entry)
+
+	_ = processEntries(pl, newEntry(nil, nil, testLabelsLogLineWithMissingKey, time.Now()))
+
 	expectedLog := "level=debug msg=\"failed to convert extracted label value to string\" err=\"Can't convert <nil> to string\" type=null"
 	if !(strings.Contains(buf.String(), expectedLog)) {
 		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
@@ -183,12 +178,13 @@ func TestLabelStage_Process(t *testing.T) {
 		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			st, err := newLabelStage(util.Logger, test.config)
+			st, err := newLabelStage(util_log.Logger, test.config)
 			if err != nil {
 				t.Fatal(err)
 			}
-			st.Process(test.inputLabels, test.extractedData, nil, nil)
-			assert.Equal(t, test.expectedLabels, test.inputLabels)
+
+			out := processEntries(st, newEntry(test.extractedData, test.inputLabels, "", time.Time{}))[0]
+			assert.Equal(t, test.expectedLabels, out.Labels)
 		})
 	}
 }

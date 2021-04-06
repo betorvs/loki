@@ -18,7 +18,7 @@ import (
 	"github.com/grafana/loki/pkg/loki"
 	logutil "github.com/grafana/loki/pkg/util"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 
 	"github.com/grafana/loki/pkg/util/validation"
 )
@@ -28,12 +28,13 @@ func init() {
 }
 
 type Config struct {
-	loki.Config  `yaml:",inline"`
-	printVersion bool
-	verifyConfig bool
-	printConfig  bool
-	logConfig    bool
-	configFile   string
+	loki.Config     `yaml:",inline"`
+	printVersion    bool
+	verifyConfig    bool
+	printConfig     bool
+	logConfig       bool
+	configFile      string
+	configExpandEnv bool
 }
 
 func (c *Config) RegisterFlags(f *flag.FlagSet) {
@@ -43,6 +44,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.logConfig, "log-config-reverse-order", false, "Dump the entire Loki config object at Info log "+
 		"level with the order reversed, reversing the order makes viewing the entries easier in Grafana.")
 	f.StringVar(&c.configFile, "config.file", "", "yaml file to load")
+	f.BoolVar(&c.configExpandEnv, "config.expand-env", false, "Expands ${var} in config according to the values of the environment variables.")
 	c.Config.RegisterFlags(f)
 }
 
@@ -73,35 +75,35 @@ func main() {
 
 	// Init the logger which will honor the log level set in config.Server
 	if reflect.DeepEqual(&config.Server.LogLevel, &logging.Level{}) {
-		level.Error(util.Logger).Log("msg", "invalid log level")
+		level.Error(util_log.Logger).Log("msg", "invalid log level")
 		os.Exit(1)
 	}
-	util.InitLogger(&config.Server)
+	util_log.InitLogger(&config.Server)
 
 	// Validate the config once both the config file has been loaded
 	// and CLI flags parsed.
-	err := config.Validate(util.Logger)
+	err := config.Validate()
 	if err != nil {
-		level.Error(util.Logger).Log("msg", "validating config", "err", err.Error())
+		level.Error(util_log.Logger).Log("msg", "validating config", "err", err.Error())
 		os.Exit(1)
 	}
 
 	if config.verifyConfig {
-		level.Info(util.Logger).Log("msg", "config is valid")
+		level.Info(util_log.Logger).Log("msg", "config is valid")
 		os.Exit(0)
 	}
 
 	if config.printConfig {
 		err := logutil.PrintConfig(os.Stderr, &config)
 		if err != nil {
-			level.Error(util.Logger).Log("msg", "failed to print config to stderr", "err", err.Error())
+			level.Error(util_log.Logger).Log("msg", "failed to print config to stderr", "err", err.Error())
 		}
 	}
 
 	if config.logConfig {
 		err := logutil.LogConfig(&config)
 		if err != nil {
-			level.Error(util.Logger).Log("msg", "failed to log config object", "err", err.Error())
+			level.Error(util_log.Logger).Log("msg", "failed to log config object", "err", err.Error())
 		}
 	}
 
@@ -109,12 +111,12 @@ func main() {
 		// Setting the environment variable JAEGER_AGENT_HOST enables tracing
 		trace, err := tracing.NewFromEnv(fmt.Sprintf("loki-%s", config.Target))
 		if err != nil {
-			level.Error(util.Logger).Log("msg", "error in initializing tracing. tracing will not be enabled", "err", err)
+			level.Error(util_log.Logger).Log("msg", "error in initializing tracing. tracing will not be enabled", "err", err)
 		}
 		defer func() {
 			if trace != nil {
 				if err := trace.Close(); err != nil {
-					level.Error(util.Logger).Log("msg", "error closing tracing", "err", err)
+					level.Error(util_log.Logger).Log("msg", "error closing tracing", "err", err)
 				}
 			}
 
@@ -123,10 +125,10 @@ func main() {
 
 	// Start Loki
 	t, err := loki.New(config.Config)
-	util.CheckFatal("initialising loki", err)
+	util_log.CheckFatal("initialising loki", err)
 
-	level.Info(util.Logger).Log("msg", "Starting Loki", "version", version.Info())
+	level.Info(util_log.Logger).Log("msg", "Starting Loki", "version", version.Info())
 
 	err = t.Run()
-	util.CheckFatal("running loki", err)
+	util_log.CheckFatal("running loki", err)
 }

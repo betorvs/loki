@@ -94,6 +94,9 @@
     deployment.spec.template.spec.withTolerations($._config.tolerations) +
     deployment.mixin.spec.template.metadata.withLabelsMixin($._config.labels) +
     deployment.mixin.spec.template.metadata.withAnnotationsMixin($._config.annotations) +
+    deployment.mixin.spec.template.metadata.withAnnotationsMixin({
+      config_hash: std.md5(std.toString($.gateway_config)),
+    }) +
     $.util.configVolumeMount('gateway-config', '/etc/nginx') +
     $.util.secretVolumeMount('gateway-secret', '/etc/nginx/secrets', defaultMode=420) +
     $.util.antiAffinity,

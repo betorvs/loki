@@ -72,9 +72,13 @@ func New(cfg Config, store storage.Store, ingesterQuerier *IngesterQuerier, limi
 		limits:          limits,
 	}
 
-	querier.engine = logql.NewEngine(cfg.Engine, &querier)
+	querier.engine = logql.NewEngine(cfg.Engine, &querier, limits)
 
 	return &querier, nil
+}
+
+func (q *Querier) SetQueryable(queryable logql.Querier) {
+	q.engine = logql.NewEngine(q.cfg.Engine, queryable, q.limits)
 }
 
 // Select Implements logql.Querier which select logs via matchers and regex filters.
@@ -206,6 +210,14 @@ func (q *Querier) buildQueryIntervals(queryStart, queryEnd time.Time) (*interval
 			end:   queryEnd,
 		}
 		return i, i
+	}
+
+	// since we are limiting the query interval, check if the query touches just the ingesters, if yes then query just the ingesters.
+	if ingesterOldestStartTime.Before(queryStart) {
+		return &interval{
+			start: queryStart,
+			end:   queryEnd,
+		}, nil
 	}
 
 	// limit the start of ingester query interval to ingesterOldestStartTime.

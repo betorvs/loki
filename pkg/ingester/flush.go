@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 
 	"github.com/grafana/loki/pkg/chunkenc"
 	loki_util "github.com/grafana/loki/pkg/util"
@@ -106,10 +108,24 @@ const (
 	flushReasonSynced = "synced"
 )
 
+// Note: this is called both during the WAL replay (zero or more times)
+// and then after replay as well.
+func (i *Ingester) InitFlushQueues() {
+	i.flushQueuesDone.Add(i.cfg.ConcurrentFlushes)
+	for j := 0; j < i.cfg.ConcurrentFlushes; j++ {
+		i.flushQueues[j] = util.NewPriorityQueue(flushQueueLength)
+		go i.flushLoop(j)
+	}
+}
+
 // Flush triggers a flush of all the chunks and closes the flush queues.
 // Called from the Lifecycler as part of the ingester shutdown.
 func (i *Ingester) Flush() {
-	i.sweepUsers(true)
+	i.flush(true)
+}
+
+func (i *Ingester) flush(mayRemoveStreams bool) {
+	i.sweepUsers(true, mayRemoveStreams)
 
 	// Close the flush queues, to unblock waiting workers.
 	for _, flushQueue := range i.flushQueues {
@@ -117,12 +133,14 @@ func (i *Ingester) Flush() {
 	}
 
 	i.flushQueuesDone.Wait()
+	level.Debug(util_log.Logger).Log("msg", "flush queues have drained")
+
 }
 
 // FlushHandler triggers a flush of all in memory chunks.  Mainly used for
 // local testing.
 func (i *Ingester) FlushHandler(w http.ResponseWriter, _ *http.Request) {
-	i.sweepUsers(true)
+	i.sweepUsers(true, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -142,25 +160,28 @@ func (o *flushOp) Priority() int64 {
 }
 
 // sweepUsers periodically schedules series for flushing and garbage collects users with no series
-func (i *Ingester) sweepUsers(immediate bool) {
+func (i *Ingester) sweepUsers(immediate, mayRemoveStreams bool) {
 	instances := i.getInstances()
 
 	for _, instance := range instances {
-		i.sweepInstance(instance, immediate)
+		i.sweepInstance(instance, immediate, mayRemoveStreams)
 	}
 }
 
-func (i *Ingester) sweepInstance(instance *instance, immediate bool) {
+func (i *Ingester) sweepInstance(instance *instance, immediate, mayRemoveStreams bool) {
 	instance.streamsMtx.Lock()
 	defer instance.streamsMtx.Unlock()
 
 	for _, stream := range instance.streams {
 		i.sweepStream(instance, stream, immediate)
-		i.removeFlushedChunks(instance, stream)
+		i.removeFlushedChunks(instance, stream, mayRemoveStreams)
 	}
 }
 
+// must hold streamsMtx
 func (i *Ingester) sweepStream(instance *instance, stream *stream, immediate bool) {
+	stream.chunkMtx.RLock()
+	defer stream.chunkMtx.RUnlock()
 	if len(stream.chunks) == 0 {
 		return
 	}
@@ -181,7 +202,7 @@ func (i *Ingester) sweepStream(instance *instance, stream *stream, immediate boo
 
 func (i *Ingester) flushLoop(j int) {
 	defer func() {
-		level.Debug(util.Logger).Log("msg", "Ingester.flushLoop() exited")
+		level.Debug(util_log.Logger).Log("msg", "Ingester.flushLoop() exited")
 		i.flushQueuesDone.Done()
 	}()
 
@@ -192,11 +213,11 @@ func (i *Ingester) flushLoop(j int) {
 		}
 		op := o.(*flushOp)
 
-		level.Debug(util.Logger).Log("msg", "flushing stream", "userid", op.userID, "fp", op.fp, "immediate", op.immediate)
+		level.Debug(util_log.Logger).Log("msg", "flushing stream", "userid", op.userID, "fp", op.fp, "immediate", op.immediate)
 
 		err := i.flushUserSeries(op.userID, op.fp, op.immediate)
 		if err != nil {
-			level.Error(util.WithUserID(op.userID, util.Logger)).Log("msg", "failed to flush user", "err", err)
+			level.Error(util_log.WithUserID(op.userID, util_log.Logger)).Log("msg", "failed to flush user", "err", err)
 		}
 
 		// If we're exiting & we failed to flush, put the failed operation
@@ -214,7 +235,7 @@ func (i *Ingester) flushUserSeries(userID string, fp model.Fingerprint, immediat
 		return nil
 	}
 
-	chunks, labels := i.collectChunksToFlush(instance, fp, immediate)
+	chunks, labels, chunkMtx := i.collectChunksToFlush(instance, fp, immediate)
 	if len(chunks) < 1 {
 		return nil
 	}
@@ -222,29 +243,26 @@ func (i *Ingester) flushUserSeries(userID string, fp model.Fingerprint, immediat
 	ctx := user.InjectOrgID(context.Background(), userID)
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.FlushOpTimeout)
 	defer cancel()
-	err := i.flushChunks(ctx, fp, labels, chunks, &instance.streamsMtx)
+	err := i.flushChunks(ctx, fp, labels, chunks, chunkMtx)
 	if err != nil {
 		return err
 	}
 
-	instance.streamsMtx.Lock()
-	for _, chunk := range chunks {
-		chunk.flushed = time.Now()
-	}
-	instance.streamsMtx.Unlock()
 	return nil
 }
 
-func (i *Ingester) collectChunksToFlush(instance *instance, fp model.Fingerprint, immediate bool) ([]*chunkDesc, labels.Labels) {
+func (i *Ingester) collectChunksToFlush(instance *instance, fp model.Fingerprint, immediate bool) ([]*chunkDesc, labels.Labels, *sync.RWMutex) {
 	instance.streamsMtx.Lock()
-	defer instance.streamsMtx.Unlock()
+	stream, ok := instance.streamsByFP[fp]
+	instance.streamsMtx.Unlock()
 
-	stream, ok := instance.streams[fp]
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var result []*chunkDesc
+	stream.chunkMtx.Lock()
+	defer stream.chunkMtx.Unlock()
 	for j := range stream.chunks {
 		shouldFlush, reason := i.shouldFlushChunk(&stream.chunks[j])
 		if immediate || shouldFlush {
@@ -262,7 +280,7 @@ func (i *Ingester) collectChunksToFlush(instance *instance, fp model.Fingerprint
 			}
 		}
 	}
-	return result, stream.labels
+	return result, stream.labels, &stream.chunkMtx
 }
 
 func (i *Ingester) shouldFlushChunk(chunk *chunkDesc) (bool, string) {
@@ -285,29 +303,38 @@ func (i *Ingester) shouldFlushChunk(chunk *chunkDesc) (bool, string) {
 	return false, ""
 }
 
-func (i *Ingester) removeFlushedChunks(instance *instance, stream *stream) {
+// must hold streamsMtx
+func (i *Ingester) removeFlushedChunks(instance *instance, stream *stream, mayRemoveStream bool) {
 	now := time.Now()
 
+	stream.chunkMtx.Lock()
+	defer stream.chunkMtx.Unlock()
 	prevNumChunks := len(stream.chunks)
+	var subtracted int
 	for len(stream.chunks) > 0 {
 		if stream.chunks[0].flushed.IsZero() || now.Sub(stream.chunks[0].flushed) < i.cfg.RetainPeriod {
 			break
 		}
 
+		subtracted += stream.chunks[0].chunk.UncompressedSize()
 		stream.chunks[0].chunk = nil // erase reference so the chunk can be garbage-collected
 		stream.chunks = stream.chunks[1:]
 	}
 	memoryChunks.Sub(float64(prevNumChunks - len(stream.chunks)))
 
-	if len(stream.chunks) == 0 {
-		delete(instance.streams, stream.fp)
+	// Signal how much data has been flushed to lessen any WAL replay pressure.
+	i.replayController.Sub(int64(subtracted))
+
+	if mayRemoveStream && len(stream.chunks) == 0 {
+		delete(instance.streamsByFP, stream.fp)
+		delete(instance.streams, stream.labelsString)
 		instance.index.Delete(stream.labels, stream.fp)
 		instance.streamsRemovedTotal.Inc()
 		memoryStreams.WithLabelValues(instance.instanceID).Dec()
 	}
 }
 
-func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelPairs labels.Labels, cs []*chunkDesc, streamsMtx sync.Locker) error {
+func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelPairs labels.Labels, cs []*chunkDesc, chunkMtx sync.Locker) error {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return err
@@ -317,25 +344,39 @@ func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelP
 	labelsBuilder.Set(nameLabel, logsValue)
 	metric := labelsBuilder.Labels()
 
-	wireChunks := make([]chunk.Chunk, 0, len(cs))
-	for _, c := range cs {
-		firstTime, lastTime := loki_util.RoundToMilliseconds(c.chunk.Bounds())
-		c := chunk.NewChunk(
-			userID, fp, metric,
-			chunkenc.NewFacade(c.chunk, i.cfg.BlockSize, i.cfg.TargetChunkSize),
-			firstTime,
-			lastTime,
-		)
+	wireChunks := make([]chunk.Chunk, len(cs))
 
-		start := time.Now()
-		streamsMtx.Lock()
-		err := c.Encode()
-		streamsMtx.Unlock()
-		if err != nil {
-			return err
+	// use anonymous function to make lock releasing simpler.
+	err = func() error {
+		chunkMtx.Lock()
+		defer chunkMtx.Unlock()
+
+		for j, c := range cs {
+			// Ensure that new blocks are cut before flushing as data in the head block is not included otherwise.
+			if err := c.chunk.Close(); err != nil {
+				return err
+			}
+			firstTime, lastTime := loki_util.RoundToMilliseconds(c.chunk.Bounds())
+			ch := chunk.NewChunk(
+				userID, fp, metric,
+				chunkenc.NewFacade(c.chunk, i.cfg.BlockSize, i.cfg.TargetChunkSize),
+				firstTime,
+				lastTime,
+			)
+
+			chunkSize := c.chunk.BytesSize() + 4*1024 // size + 4kB should be enough room for cortex header
+			start := time.Now()
+			if err := ch.EncodeTo(bytes.NewBuffer(make([]byte, 0, chunkSize))); err != nil {
+				return err
+			}
+			chunkEncodeTime.Observe(time.Since(start).Seconds())
+			wireChunks[j] = ch
 		}
-		chunkEncodeTime.Observe(time.Since(start).Seconds())
-		wireChunks = append(wireChunks, c)
+		return nil
+	}()
+
+	if err != nil {
+		return err
 	}
 
 	if err := i.store.Put(ctx, wireChunks); err != nil {
@@ -345,7 +386,15 @@ func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelP
 	// Record statistics only when actual put request did not return error.
 	sizePerTenant := chunkSizePerTenant.WithLabelValues(userID)
 	countPerTenant := chunksPerTenant.WithLabelValues(userID)
+
+	chunkMtx.Lock()
+	defer chunkMtx.Unlock()
+
 	for i, wc := range wireChunks {
+
+		// flush successful, write while we have lock
+		cs[i].flushed = time.Now()
+
 		numEntries := cs[i].chunk.Size()
 		byt, err := wc.Encoded()
 		if err != nil {

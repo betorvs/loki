@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -42,7 +42,7 @@ func (q *Querier) RangeQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := q.validateEntriesLimits(ctx, request.Limit); err != nil {
+	if err := q.validateEntriesLimits(ctx, request.Query, request.Limit); err != nil {
 		serverutil.WriteError(err, w)
 		return
 	}
@@ -82,7 +82,7 @@ func (q *Querier) InstantQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := q.validateEntriesLimits(ctx, request.Limit); err != nil {
+	if err := q.validateEntriesLimits(ctx, request.Query, request.Limit); err != nil {
 		serverutil.WriteError(err, w)
 		return
 	}
@@ -139,7 +139,7 @@ func (q *Querier) LogQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := q.validateEntriesLimits(ctx, request.Limit); err != nil {
+	if err := q.validateEntriesLimits(ctx, request.Query, request.Limit); err != nil {
 		serverutil.WriteError(err, w)
 		return
 	}
@@ -198,7 +198,7 @@ func (q *Querier) TailHandler(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	logger := util.WithContext(r.Context(), util.Logger)
+	logger := util_log.WithContext(r.Context(), util_log.Logger)
 
 	req, err := loghttp.ParseTailQuery(r)
 	if err != nil {
@@ -332,7 +332,7 @@ func parseRegexQuery(httpRequest *http.Request) (string, error) {
 	query := httpRequest.Form.Get("query")
 	regexp := httpRequest.Form.Get("regexp")
 	if regexp != "" {
-		expr, err := logql.ParseLogSelector(query)
+		expr, err := logql.ParseLogSelector(query, true)
 		if err != nil {
 			return "", err
 		}
@@ -345,10 +345,20 @@ func parseRegexQuery(httpRequest *http.Request) (string, error) {
 	return query, nil
 }
 
-func (q *Querier) validateEntriesLimits(ctx context.Context, limit uint32) error {
+func (q *Querier) validateEntriesLimits(ctx context.Context, query string, limit uint32) error {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+	}
+
+	expr, err := logql.ParseExpr(query)
+	if err != nil {
+		return err
+	}
+
+	// entry limit does not apply to metric queries.
+	if _, ok := expr.(logql.SampleExpr); ok {
+		return nil
 	}
 
 	maxEntriesLimit := q.limits.MaxEntriesLimitPerQuery(userID)

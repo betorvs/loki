@@ -50,15 +50,16 @@
 
   ingester_data_pvc:: if $._config.stateful_ingesters then
     pvc.new('ingester-data') +
-    pvc.mixin.spec.resources.withRequests({ storage: '10Gi' }) +
+    pvc.mixin.spec.resources.withRequests({ storage: $._config.ingester_pvc_size }) +
     pvc.mixin.spec.withAccessModes(['ReadWriteOnce']) +
-    pvc.mixin.spec.withStorageClassName('fast')
+    pvc.mixin.spec.withStorageClassName($._config.ingester_pvc_class)
   else {},
 
   ingester_statefulset: if $._config.stateful_ingesters then
     statefulSet.new('ingester', $._config.ingester.replicas, [$.ingester_container], $.ingester_data_pvc) +
     statefulSet.mixin.spec.withServiceName('ingester') +
     statefulSet.spec.template.spec.withTolerations($._config.tolerations) +
+    statefulSet.mixin.spec.withPodManagementPolicy('Parallel') +
     $.config_hash_mixin +
     statefulSet.mixin.spec.template.metadata.withLabelsMixin($._config.labels) +
     statefulSet.mixin.spec.template.metadata.withAnnotationsMixin($._config.annotations) +

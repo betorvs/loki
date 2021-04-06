@@ -130,7 +130,7 @@ scrape_configs:
           component:
 
   # This stage will only run if the scraped target has a label "app"
-  # with a value of "some-app" and the log line doesn't contains the word "info"
+  # with a value of "some-app" and the log line doesn't contain the word "info"
   - match:
       selector: '{app="some-app"} != "info"'
       stages:
@@ -206,6 +206,7 @@ Parsing stages:
 
 Transform stages:
 
+  - [multiline](../stages/multiline/): Merges multiple lines, e.g. stack traces, into multiline blocks.
   - [template](../stages/template/): Use Go templates to modify extracted data.
 
 Action stages:

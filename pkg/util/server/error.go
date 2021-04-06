@@ -6,7 +6,9 @@ import (
 	"net/http"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/loki/pkg/logql"
 )
@@ -21,16 +23,22 @@ const (
 
 // WriteError write a go error with the correct status code.
 func WriteError(err error, w http.ResponseWriter) {
-	var queryErr chunk.QueryError
+	var (
+		queryErr chunk.QueryError
+		promErr  promql.ErrStorage
+	)
 
 	switch {
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled) ||
+		(errors.As(err, &promErr) && errors.Is(promErr.Err, context.Canceled)):
 		http.Error(w, ErrClientCanceled, StatusClientClosedRequest)
 	case errors.Is(err, context.DeadlineExceeded):
 		http.Error(w, ErrDeadlineExceeded, http.StatusGatewayTimeout)
 	case errors.As(err, &queryErr):
 		http.Error(w, err.Error(), http.StatusBadRequest)
-	case logql.IsParseError(err) || logql.IsPipelineError(err):
+	case errors.Is(err, logql.ErrLimit) || errors.Is(err, logql.ErrParse) || errors.Is(err, logql.ErrPipeline):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, user.ErrNoOrgID):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	default:
 		if grpcErr, ok := httpgrpc.HTTPResponseFromError(err); ok {

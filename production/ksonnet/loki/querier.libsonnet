@@ -41,13 +41,14 @@
     pvc.new('querier-data') +
     pvc.mixin.spec.resources.withRequests({ storage: $._config.querier_pvc_size }) +
     pvc.mixin.spec.withAccessModes(['ReadWriteOnce']) +
-    pvc.mixin.spec.withStorageClassName('fast')
+    pvc.mixin.spec.withStorageClassName($._config.querier_pvc_class)
   else {},
 
   querier_statefulset: if $._config.stateful_queriers then
     statefulSet.new('querier', $._config.querier.replicas, [$.querier_container], $.querier_data_pvc) +
     statefulSet.mixin.spec.withServiceName('querier') +
     statefulSet.spec.template.spec.withTolerations($._config.tolerations) +
+    statefulSet.mixin.spec.withPodManagementPolicy('Parallel') +
     $.config_hash_mixin +
     statefulSet.mixin.spec.template.metadata.withLabelsMixin($._config.labels) +
     statefulSet.mixin.spec.template.metadata.withAnnotationsMixin($._config.annotations) +

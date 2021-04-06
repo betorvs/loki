@@ -7,7 +7,13 @@ import (
 	"fmt"
 	"net/http"
 
+	frontend "github.com/cortexproject/cortex/pkg/frontend/v1"
+	"github.com/cortexproject/cortex/pkg/querier/worker"
+	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
+	"github.com/felixge/fgprof"
+
 	"github.com/grafana/loki/pkg/storage/stores/shipper/compactor"
+	"github.com/grafana/loki/pkg/util/runtime"
 
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/modules"
@@ -15,16 +21,15 @@ import (
 	"github.com/weaveworks/common/signals"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/querier/frontend"
+	cortex_tripper "github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	cortex_ruler "github.com/cortexproject/cortex/pkg/ruler"
-	"github.com/cortexproject/cortex/pkg/ruler/rules"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/services"
 
-	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/weaveworks/common/middleware"
@@ -60,7 +65,7 @@ type Config struct {
 	SchemaConfig     storage.SchemaConfig        `yaml:"schema_config,omitempty"`
 	LimitsConfig     validation.Limits           `yaml:"limits_config,omitempty"`
 	TableManager     chunk.TableManagerConfig    `yaml:"table_manager,omitempty"`
-	Worker           frontend.WorkerConfig       `yaml:"frontend_worker,omitempty"`
+	Worker           worker.Config               `yaml:"frontend_worker,omitempty"`
 	Frontend         lokifrontend.Config         `yaml:"frontend,omitempty"`
 	Ruler            ruler.Config                `yaml:"ruler,omitempty"`
 	QueryRange       queryrange.Config           `yaml:"query_range,omitempty"`
@@ -108,14 +113,14 @@ func (c *Config) Clone() flagext.Registerer {
 
 // Validate the config and returns an error if the validation
 // doesn't pass
-func (c *Config) Validate(log log.Logger) error {
+func (c *Config) Validate() error {
 	if err := c.SchemaConfig.Validate(); err != nil {
 		return errors.Wrap(err, "invalid schema config")
 	}
 	if err := c.StorageConfig.Validate(); err != nil {
 		return errors.Wrap(err, "invalid storage config")
 	}
-	if err := c.QueryRange.Validate(log); err != nil {
+	if err := c.QueryRange.Validate(); err != nil {
 		return errors.Wrap(err, "invalid queryrange config")
 	}
 	if err := c.TableManager.Validate(); err != nil {
@@ -123,6 +128,15 @@ func (c *Config) Validate(log log.Logger) error {
 	}
 	if err := c.Ruler.Validate(); err != nil {
 		return errors.Wrap(err, "invalid ruler config")
+	}
+	if err := c.Ingester.Validate(); err != nil {
+		return errors.Wrap(err, "invalid ingester config")
+	}
+	if err := c.StorageConfig.BoltDBShipperConfig.Validate(); err != nil {
+		return errors.Wrap(err, "invalid boltdb-shipper config")
+	}
+	if err := c.CompactorConfig.Validate(); err != nil {
+		return errors.Wrap(err, "invalid compactor config")
 	}
 	return nil
 }
@@ -132,28 +146,30 @@ type Loki struct {
 	cfg Config
 
 	// set during initialization
-	moduleManager *modules.Manager
+	ModuleManager *modules.Manager
 	serviceMap    map[string]services.Service
 
-	server          *server.Server
-	ring            *ring.Ring
-	overrides       *validation.Overrides
-	distributor     *distributor.Distributor
-	ingester        *ingester.Ingester
-	querier         *querier.Querier
-	ingesterQuerier *querier.IngesterQuerier
-	store           storage.Store
-	tableManager    *chunk.TableManager
-	frontend        *frontend.Frontend
-	ruler           *cortex_ruler.Ruler
-	RulerStorage    rules.RuleStore
-	rulerAPI        *cortex_ruler.API
-	stopper         queryrange.Stopper
-	runtimeConfig   *runtimeconfig.Manager
-	memberlistKV    *memberlist.KVInitService
-	compactor       *compactor.Compactor
+	Server                   *server.Server
+	ring                     *ring.Ring
+	overrides                *validation.Overrides
+	tenantConfigs            *runtime.TenantConfigs
+	distributor              *distributor.Distributor
+	ingester                 *ingester.Ingester
+	Querier                  *querier.Querier
+	ingesterQuerier          *querier.IngesterQuerier
+	store                    storage.Store
+	tableManager             *chunk.TableManager
+	frontend                 *frontend.Frontend
+	ruler                    *cortex_ruler.Ruler
+	RulerStorage             rulestore.RuleStore
+	rulerAPI                 *cortex_ruler.API
+	stopper                  queryrange.Stopper
+	runtimeConfig            *runtimeconfig.Manager
+	memberlistKV             *memberlist.KVInitService
+	compactor                *compactor.Compactor
+	QueryFrontEndTripperware cortex_tripper.Tripperware
 
-	httpAuthMiddleware middleware.Interface
+	HTTPAuthMiddleware middleware.Interface
 }
 
 // New makes a new Loki.
@@ -177,11 +193,11 @@ func (t *Loki) setupAuthMiddleware() {
 	if t.cfg.AuthEnabled {
 		t.cfg.Server.GRPCMiddleware = append(t.cfg.Server.GRPCMiddleware, middleware.ServerUserHeaderInterceptor)
 		t.cfg.Server.GRPCStreamMiddleware = append(t.cfg.Server.GRPCStreamMiddleware, GRPCStreamAuthInterceptor)
-		t.httpAuthMiddleware = middleware.AuthenticateUser
+		t.HTTPAuthMiddleware = middleware.AuthenticateUser
 	} else {
 		t.cfg.Server.GRPCMiddleware = append(t.cfg.Server.GRPCMiddleware, fakeGRPCAuthUnaryMiddleware)
 		t.cfg.Server.GRPCStreamMiddleware = append(t.cfg.Server.GRPCStreamMiddleware, fakeGRPCAuthStreamMiddleware)
-		t.httpAuthMiddleware = fakeHTTPAuthMiddleware
+		t.HTTPAuthMiddleware = fakeHTTPAuthMiddleware
 	}
 }
 
@@ -199,15 +215,22 @@ var GRPCStreamAuthInterceptor = func(srv interface{}, ss grpc.ServerStream, info
 	}
 }
 
+func newDefaultConfig() *Config {
+	defaultConfig := &Config{}
+	defaultFS := flag.NewFlagSet("", flag.PanicOnError)
+	defaultConfig.RegisterFlags(defaultFS)
+	return defaultConfig
+}
+
 // Run starts Loki running, and blocks until a Loki stops.
 func (t *Loki) Run() error {
-	serviceMap, err := t.moduleManager.InitModuleServices(t.cfg.Target)
+	serviceMap, err := t.ModuleManager.InitModuleServices(t.cfg.Target)
 	if err != nil {
 		return err
 	}
 
 	t.serviceMap = serviceMap
-	t.server.HTTP.Handle("/services", http.HandlerFunc(t.servicesHandler))
+	t.Server.HTTP.Handle("/services", http.HandlerFunc(t.servicesHandler))
 
 	// get all services, create service manager and tell it to start
 	var servs []services.Service
@@ -221,11 +244,16 @@ func (t *Loki) Run() error {
 	}
 
 	// before starting servers, register /ready handler. It should reflect entire Loki.
-	t.server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
+	t.Server.HTTP.Path("/ready").Handler(t.readyHandler(sm))
+
+	// This adds a way to see the config and the changes compared to the defaults
+	t.Server.HTTP.Path("/config").HandlerFunc(configHandler(t.cfg, newDefaultConfig()))
+
+	t.Server.HTTP.Path("/debug/fgprof").Handler(fgprof.Handler())
 
 	// Let's listen for events from this manager, and log them.
-	healthy := func() { level.Info(util.Logger).Log("msg", "Loki started") }
-	stopped := func() { level.Info(util.Logger).Log("msg", "Loki stopped") }
+	healthy := func() { level.Info(util_log.Logger).Log("msg", "Loki started") }
+	stopped := func() { level.Info(util_log.Logger).Log("msg", "Loki stopped") }
 	serviceFailed := func(service services.Service) {
 		// if any service fails, stop entire Loki
 		sm.StopAsync()
@@ -234,21 +262,21 @@ func (t *Loki) Run() error {
 		for m, s := range serviceMap {
 			if s == service {
 				if service.FailureCase() == util.ErrStopProcess {
-					level.Info(util.Logger).Log("msg", "received stop signal via return error", "module", m, "error", service.FailureCase())
+					level.Info(util_log.Logger).Log("msg", "received stop signal via return error", "module", m, "error", service.FailureCase())
 				} else {
-					level.Error(util.Logger).Log("msg", "module failed", "module", m, "error", service.FailureCase())
+					level.Error(util_log.Logger).Log("msg", "module failed", "module", m, "error", service.FailureCase())
 				}
 				return
 			}
 		}
 
-		level.Error(util.Logger).Log("msg", "module failed", "module", "unknown", "error", service.FailureCase())
+		level.Error(util_log.Logger).Log("msg", "module failed", "module", "unknown", "error", service.FailureCase())
 	}
 
 	sm.AddListener(services.NewManagerListener(healthy, stopped, serviceFailed))
 
 	// Setup signal handler. If signal arrives, we stop the manager, which stops all the services.
-	handler := signals.NewHandler(t.server.Log)
+	handler := signals.NewHandler(t.Server.Log)
 	go func() {
 		handler.Loop()
 		sm.StopAsync()
@@ -325,6 +353,7 @@ func (t *Loki) setupModuleManager() error {
 	mm.RegisterModule(MemberlistKV, t.initMemberlistKV)
 	mm.RegisterModule(Ring, t.initRing)
 	mm.RegisterModule(Overrides, t.initOverrides)
+	mm.RegisterModule(TenantConfigs, t.initTenantConfigs)
 	mm.RegisterModule(Distributor, t.initDistributor)
 	mm.RegisterModule(Store, t.initStore)
 	mm.RegisterModule(Ingester, t.initIngester)
@@ -341,12 +370,13 @@ func (t *Loki) setupModuleManager() error {
 	deps := map[string][]string{
 		Ring:            {RuntimeConfig, Server, MemberlistKV},
 		Overrides:       {RuntimeConfig},
-		Distributor:     {Ring, Server, Overrides},
+		TenantConfigs:   {RuntimeConfig},
+		Distributor:     {Ring, Server, Overrides, TenantConfigs},
 		Store:           {Overrides},
-		Ingester:        {Store, Server, MemberlistKV},
-		Querier:         {Store, Ring, Server, IngesterQuerier},
-		QueryFrontend:   {Server, Overrides},
-		Ruler:           {Ring, Server, Store, RulerStorage, IngesterQuerier},
+		Ingester:        {Store, Server, MemberlistKV, TenantConfigs},
+		Querier:         {Store, Ring, Server, IngesterQuerier, TenantConfigs},
+		QueryFrontend:   {Server, Overrides, TenantConfigs},
+		Ruler:           {Ring, Server, Store, RulerStorage, IngesterQuerier, Overrides, TenantConfigs},
 		TableManager:    {Server},
 		Compactor:       {Server},
 		IngesterQuerier: {Ring},
@@ -370,7 +400,7 @@ func (t *Loki) setupModuleManager() error {
 		}
 	}
 
-	t.moduleManager = mm
+	t.ModuleManager = mm
 
 	return nil
 }

@@ -4,16 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/chunk/local"
 	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -40,11 +42,6 @@ type StorageClient interface {
 	List(ctx context.Context, prefix, delimiter string) ([]chunk.StorageObject, []chunk.StorageCommonPrefix, error)
 }
 
-type downloadedFile struct {
-	mtime  time.Time
-	boltdb *bbolt.DB
-}
-
 // Table is a collection of multiple files created for a same table by various ingesters.
 // All the public methods are concurrency safe and take care of mutexes to avoid any data race.
 type Table struct {
@@ -55,7 +52,7 @@ type Table struct {
 	boltDBIndexClient BoltDBIndexClient
 
 	lastUsedAt time.Time
-	dbs        map[string]*downloadedFile
+	dbs        map[string]*bbolt.DB
 	dbsMtx     sync.RWMutex
 	err        error
 
@@ -73,7 +70,7 @@ func NewTable(spanCtx context.Context, name, cacheLocation string, storageClient
 		storageClient:     storageClient,
 		boltDBIndexClient: boltDBIndexClient,
 		lastUsedAt:        time.Now(),
-		dbs:               map[string]*downloadedFile{},
+		dbs:               map[string]*bbolt.DB{},
 		ready:             make(chan struct{}),
 		cancelFunc:        cancel,
 	}
@@ -93,11 +90,78 @@ func NewTable(spanCtx context.Context, name, cacheLocation string, storageClient
 		// Using background context to avoid cancellation of download when request times out.
 		// We would anyways need the files for serving next requests.
 		if err := table.init(ctx, log); err != nil {
-			level.Error(util.Logger).Log("msg", "failed to download table", "name", table.name)
+			level.Error(util_log.Logger).Log("msg", "failed to download table", "name", table.name)
 		}
 	}()
 
 	return &table
+}
+
+// LoadTable loads a table from local storage(syncs the table too if we have it locally) or downloads it from the shared store.
+func LoadTable(ctx context.Context, name, cacheLocation string, storageClient StorageClient, boltDBIndexClient BoltDBIndexClient, metrics *metrics) (*Table, error) {
+	// see if folder for table already exists.
+	folderPath := path.Join(cacheLocation, name)
+	_, err := os.Stat(folderPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+
+		// folder for table doesn't exist, this means we have to download it from the shared store.
+		table := NewTable(ctx, name, cacheLocation, storageClient, boltDBIndexClient, metrics)
+		<-table.ready
+		if table.err != nil {
+			return nil, table.err
+		}
+		return table, nil
+	}
+
+	// folder for table already exists, open all the boltdb files from it.
+	filesInfo, err := ioutil.ReadDir(folderPath)
+	if err != nil {
+		return nil, err
+	}
+
+	table := Table{
+		name:              name,
+		cacheLocation:     cacheLocation,
+		metrics:           metrics,
+		storageClient:     storageClient,
+		boltDBIndexClient: boltDBIndexClient,
+		lastUsedAt:        time.Now(),
+		dbs:               map[string]*bbolt.DB{},
+		ready:             make(chan struct{}),
+		cancelFunc:        func() {},
+	}
+
+	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("opening locally present files for table %s", name), "files", fmt.Sprint(filesInfo))
+
+	for _, fileInfo := range filesInfo {
+		if fileInfo.IsDir() {
+			continue
+		}
+
+		// if we fail to open a boltdb file, lets skip it and let sync operation re-download the file from storage.
+		boltdb, err := shipper_util.SafeOpenBoltdbFile(filepath.Join(folderPath, fileInfo.Name()))
+		if err != nil {
+			level.Error(util_log.Logger).Log("msg", fmt.Sprintf("failed to open existing boltdb file %s, continuing without it to let the sync operation catch up", filepath.Join(folderPath, fileInfo.Name())), "err", err)
+			continue
+		}
+
+		table.dbs[fileInfo.Name()] = boltdb
+	}
+
+	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("syncing files for table %s", name))
+	// sync the table to get new files and remove the deleted ones from storage.
+	err = table.Sync(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// close the ready channel because the query function waits for it to be closed before performing queries.
+	close(table.ready)
+
+	return &table, nil
 }
 
 // init downloads all the db files for the table from object storage.
@@ -109,12 +173,12 @@ func (t *Table) init(ctx context.Context, spanLogger log.Logger) (err error) {
 			status = statusFailure
 			t.err = err
 
-			level.Error(util.Logger).Log("msg", fmt.Sprintf("failed to initialize table %s, cleaning it up", t.name), "err", err)
+			level.Error(util_log.Logger).Log("msg", fmt.Sprintf("failed to initialize table %s, cleaning it up", t.name), "err", err)
 
 			// cleaning up files due to error to avoid returning invalid results.
 			for fileName := range t.dbs {
 				if err := t.cleanupDB(fileName); err != nil {
-					level.Error(util.Logger).Log("msg", "failed to cleanup partially downloaded file", "filename", fileName, "err", err)
+					level.Error(util_log.Logger).Log("msg", "failed to cleanup partially downloaded file", "filename", fileName, "err", err)
 				}
 			}
 		}
@@ -131,7 +195,7 @@ func (t *Table) init(ctx context.Context, spanLogger log.Logger) (err error) {
 		return
 	}
 
-	level.Debug(util.Logger).Log("msg", fmt.Sprintf("list of files to download for period %s: %s", t.name, objects))
+	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("list of files to download for period %s: %s", t.name, objects))
 
 	folderPath, err := t.folderPathForTable(true)
 	if err != nil {
@@ -146,18 +210,18 @@ func (t *Table) init(ctx context.Context, spanLogger log.Logger) (err error) {
 
 	level.Debug(spanLogger).Log("total-files-downloaded", len(objects))
 
+	objects = shipper_util.RemoveDirectories(objects)
+
 	// open all the downloaded dbs
 	for _, object := range objects {
+
 		dbName, err := getDBNameFromObjectKey(object.Key)
 		if err != nil {
 			return err
 		}
 
 		filePath := path.Join(folderPath, dbName)
-		df := downloadedFile{}
-
-		df.mtime = object.ModifiedAt
-		df.boltdb, err = local.OpenBoltdbFile(filePath)
+		boltdb, err := shipper_util.SafeOpenBoltdbFile(filePath)
 		if err != nil {
 			return err
 		}
@@ -170,7 +234,7 @@ func (t *Table) init(ctx context.Context, spanLogger log.Logger) (err error) {
 
 		totalFilesSize += stat.Size()
 
-		t.dbs[dbName] = &df
+		t.dbs[dbName] = boltdb
 	}
 
 	duration := time.Since(startTime).Seconds()
@@ -190,18 +254,12 @@ func (t *Table) Close() {
 	defer t.dbsMtx.Unlock()
 
 	for name, db := range t.dbs {
-		dbPath := db.boltdb.Path()
-
-		if err := db.boltdb.Close(); err != nil {
-			level.Error(util.Logger).Log("msg", fmt.Sprintf("failed to close file %s for table %s", name, t.name), "err", err)
-		}
-
-		if err := os.Remove(dbPath); err != nil {
-			level.Error(util.Logger).Log("msg", fmt.Sprintf("failed to remove file %s for table %s", name, t.name), "err", err)
+		if err := db.Close(); err != nil {
+			level.Error(util_log.Logger).Log("msg", fmt.Sprintf("failed to close file %s for table %s", name, t.name), "err", err)
 		}
 	}
 
-	t.dbs = map[string]*downloadedFile{}
+	t.dbs = map[string]*bbolt.DB{}
 }
 
 // MultiQueries runs multiple queries without having to take lock multiple times for each query.
@@ -227,19 +285,15 @@ func (t *Table) MultiQueries(ctx context.Context, queries []chunk.IndexQuery, ca
 
 	level.Debug(log).Log("table-name", t.name, "query-count", len(queries))
 
-	id := shipper_util.NewIndexDeduper(callback)
-
 	for name, db := range t.dbs {
-		err := db.boltdb.View(func(tx *bbolt.Tx) error {
+		err := db.View(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket(bucketName)
 			if bucket == nil {
 				return nil
 			}
 
 			for _, query := range queries {
-				if err := t.boltDBIndexClient.QueryWithCursor(ctx, bucket.Cursor(), query, func(query chunk.IndexQuery, batch chunk.ReadBatch) (shouldContinue bool) {
-					return id.Callback(query, batch)
-				}); err != nil {
+				if err := t.boltDBIndexClient.QueryWithCursor(ctx, bucket.Cursor(), query, callback); err != nil {
 					return err
 				}
 			}
@@ -267,7 +321,12 @@ func (t *Table) CleanupAllDBs() error {
 			return err
 		}
 	}
-	return nil
+
+	tablePath, err := t.folderPathForTable(false)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(tablePath)
 }
 
 // Err returns the err which is usually set when there was any issue in init.
@@ -280,15 +339,19 @@ func (t *Table) LastUsedAt() time.Time {
 	return t.lastUsedAt
 }
 
+func (t *Table) UpdateLastUsedAt() {
+	t.lastUsedAt = time.Now()
+}
+
 func (t *Table) cleanupDB(fileName string) error {
 	df, ok := t.dbs[fileName]
 	if !ok {
 		return fmt.Errorf("file %s not found in files collection for cleaning up", fileName)
 	}
 
-	filePath := df.boltdb.Path()
+	filePath := df.Path()
 
-	if err := df.boltdb.Close(); err != nil {
+	if err := df.Close(); err != nil {
 		return err
 	}
 
@@ -299,14 +362,14 @@ func (t *Table) cleanupDB(fileName string) error {
 
 // Sync downloads updated and new files from the storage relevant for the table and removes the deleted ones
 func (t *Table) Sync(ctx context.Context) error {
-	level.Debug(util.Logger).Log("msg", fmt.Sprintf("syncing files for table %s", t.name))
+	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("syncing files for table %s", t.name))
 
 	toDownload, toDelete, err := t.checkStorageForUpdates(ctx)
 	if err != nil {
 		return err
 	}
 
-	level.Debug(util.Logger).Log("msg", fmt.Sprintf("updates for table %s. toDownload: %s, toDelete: %s", t.name, toDownload, toDelete))
+	level.Debug(util_log.Logger).Log("msg", fmt.Sprintf("updates for table %s. toDownload: %s, toDelete: %s", t.name, toDownload, toDelete))
 
 	for _, storageObject := range toDownload {
 		err = t.downloadFile(ctx, storageObject)
@@ -345,16 +408,20 @@ func (t *Table) checkStorageForUpdates(ctx context.Context) (toDownload []chunk.
 	t.dbsMtx.RLock()
 	defer t.dbsMtx.RUnlock()
 
+	objects = shipper_util.RemoveDirectories(objects)
+
 	for _, object := range objects {
+
 		dbName, err := getDBNameFromObjectKey(object.Key)
 		if err != nil {
 			return nil, nil, err
 		}
 		listedDBs[dbName] = struct{}{}
 
-		// Checking whether file was updated in the store after we downloaded it, if not, no need to include it in updates
-		downloadedFileDetails, ok := t.dbs[dbName]
-		if !ok || downloadedFileDetails.mtime != object.ModifiedAt {
+		// Checking whether file was already downloaded, if not, download it.
+		// We do not ever upload files in the object store with the same name but different contents so we do not consider downloading modified files again.
+		_, ok := t.dbs[dbName]
+		if !ok {
 			toDownload = append(toDownload, object)
 		}
 	}
@@ -370,7 +437,7 @@ func (t *Table) checkStorageForUpdates(ctx context.Context) (toDownload []chunk.
 
 // downloadFile first downloads file to a temp location so that we can close the existing db(if already exists), replace it with new one and then reopen it.
 func (t *Table) downloadFile(ctx context.Context, storageObject chunk.StorageObject) error {
-	level.Info(util.Logger).Log("msg", fmt.Sprintf("downloading object from storage with key %s", storageObject.Key))
+	level.Info(util_log.Logger).Log("msg", fmt.Sprintf("downloading object from storage with key %s", storageObject.Key))
 
 	dbName, err := getDBNameFromObjectKey(storageObject.Key)
 	if err != nil {
@@ -379,10 +446,7 @@ func (t *Table) downloadFile(ctx context.Context, storageObject chunk.StorageObj
 	folderPath, _ := t.folderPathForTable(false)
 	filePath := path.Join(folderPath, dbName)
 
-	// download the file temporarily with some other name to allow boltdb client to close the existing file first if it exists
-	tempFilePath := path.Join(folderPath, fmt.Sprintf("%s.%s", dbName, "temp"))
-
-	err = shipper_util.GetFileFromStorage(ctx, t.storageClient, storageObject.Key, tempFilePath)
+	err = shipper_util.GetFileFromStorage(ctx, t.storageClient, storageObject.Key, filePath)
 	if err != nil {
 		return err
 	}
@@ -390,28 +454,12 @@ func (t *Table) downloadFile(ctx context.Context, storageObject chunk.StorageObj
 	t.dbsMtx.Lock()
 	defer t.dbsMtx.Unlock()
 
-	df, ok := t.dbs[dbName]
-	if ok {
-		if err := df.boltdb.Close(); err != nil {
-			return err
-		}
-	} else {
-		df = &downloadedFile{}
-	}
-
-	// move the file from temp location to actual location
-	err = os.Rename(tempFilePath, filePath)
+	boltdb, err := shipper_util.SafeOpenBoltdbFile(filePath)
 	if err != nil {
 		return err
 	}
 
-	df.mtime = storageObject.ModifiedAt
-	df.boltdb, err = local.OpenBoltdbFile(filePath)
-	if err != nil {
-		return err
-	}
-
-	t.dbs[dbName] = df
+	t.dbs[dbName] = boltdb
 
 	return nil
 }
@@ -447,7 +495,7 @@ func (t *Table) doParallelDownload(ctx context.Context, objects []chunk.StorageO
 	defer cancel()
 
 	queue := make(chan chunk.StorageObject)
-	n := util.Min(len(objects), downloadParallelism)
+	n := util_math.Min(len(objects), downloadParallelism)
 	incomingErrors := make(chan error)
 
 	// Run n parallel goroutines fetching objects to download from the queue
@@ -459,6 +507,11 @@ func (t *Table) doParallelDownload(ctx context.Context, objects []chunk.StorageO
 				object, ok := <-queue
 				if !ok {
 					break
+				}
+
+				// The s3 client can also return the directory itself in the ListObjects.
+				if shipper_util.IsDirectory(object.Key) {
+					continue
 				}
 
 				var dbName string

@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/loki/pkg/logproto"
 )
@@ -35,23 +36,22 @@ func TestMappingEquivalence(t *testing.T) {
 		{`1 + 1`, false},
 		{`{a="1"}`, false},
 		{`{a="1"} |= "number: 10"`, false},
-		{`rate({a=~".*"}[1s])`, false},
-		{`sum by (a) (rate({a=~".*"}[1s]))`, false},
-		{`sum(rate({a=~".*"}[1s]))`, false},
-
-		{`max without (a) (rate({a=~".*"}[1s]))`, false},
-		{`count(rate({a=~".*"}[1s]))`, false},
-		{`avg(rate({a=~".*"}[1s]))`, true},
-		{`avg(rate({a=~".*"}[1s])) by (a)`, true},
-		{`1 + sum by (cluster) (rate({a=~".*"}[1s]))`, false},
-		{`sum(max(rate({a=~".*"}[1s])))`, false},
-		{`max(count(rate({a=~".*"}[1s])))`, false},
-		{`max(sum by (cluster) (rate({a=~".*"}[1s]))) / count(rate({a=~".*"}[1s]))`, false},
+		{`rate({a=~".+"}[1s])`, false},
+		{`sum by (a) (rate({a=~".+"}[1s]))`, false},
+		{`sum(rate({a=~".+"}[1s]))`, false},
+		{`max without (a) (rate({a=~".+"}[1s]))`, false},
+		{`count(rate({a=~".+"}[1s]))`, false},
+		{`avg(rate({a=~".+"}[1s]))`, true},
+		{`avg(rate({a=~".+"}[1s])) by (a)`, true},
+		{`1 + sum by (cluster) (rate({a=~".+"}[1s]))`, false},
+		{`sum(max(rate({a=~".+"}[1s])))`, false},
+		{`max(count(rate({a=~".+"}[1s])))`, false},
+		{`max(sum by (cluster) (rate({a=~".+"}[1s]))) / count(rate({a=~".+"}[1s]))`, false},
 		// topk prefers already-seen values in tiebreakers. Since the test data generates
 		// the same log lines for each series & the resulting promql.Vectors aren't deterministically
 		// sorted by labels, we don't expect this to pass.
 		// We could sort them as stated, but it doesn't seem worth the performance hit.
-		// {`topk(3, rate({a=~".*"}[1s]))`, false},
+		// {`topk(3, rate({a=~".+"}[1s]))`, false},
 	} {
 		q := NewMockQuerier(
 			shards,
@@ -59,8 +59,8 @@ func TestMappingEquivalence(t *testing.T) {
 		)
 
 		opts := EngineOpts{}
-		regular := NewEngine(opts, q)
-		sharded := NewShardedEngine(opts, MockDownstreamer{regular}, nilMetrics)
+		regular := NewEngine(opts, q, NoLimits)
+		sharded := NewShardedEngine(opts, MockDownstreamer{regular}, nilMetrics, NoLimits)
 
 		t.Run(tc.query, func(t *testing.T) {
 			params := NewLiteralParams(
@@ -74,7 +74,7 @@ func TestMappingEquivalence(t *testing.T) {
 				nil,
 			)
 			qry := regular.Query(params)
-			ctx := context.Background()
+			ctx := user.InjectOrgID(context.Background(), "fake")
 
 			mapper, err := NewShardMapper(shards, nilMetrics)
 			require.Nil(t, err)

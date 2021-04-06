@@ -26,6 +26,7 @@ import (
   MetricExpr              SampleExpr
   VectorOp                string
   BinOpExpr               SampleExpr
+  LabelReplaceExpr        SampleExpr
   binOp                   string
   bytes                   uint64
   str                     string
@@ -45,7 +46,11 @@ import (
   LabelFormatExpr         *labelFmtExpr
   LabelFormat             log.LabelFmt
   LabelsFormat            []log.LabelFmt
+  JSONExpressionParser    *jsonExpressionParser
+  JSONExpression          log.JSONExpression
+  JSONExpressionList      []log.JSONExpression
   UnwrapExpr              *unwrapExpr
+  OffsetExpr              *offsetExpr
 }
 
 %start root
@@ -67,6 +72,7 @@ import (
 %type <VectorOp>              vectorOp
 %type <BinOpExpr>             binOpExpr
 %type <LiteralExpr>           literalExpr
+%type <LabelReplaceExpr>      labelReplaceExpr
 %type <BinOpModifier>         binOpModifier
 %type <LabelParser>           labelParser
 %type <PipelineExpr>          pipelineExpr
@@ -80,8 +86,12 @@ import (
 %type <LabelFormatExpr>       labelFormatExpr
 %type <LabelFormat>           labelFormat
 %type <LabelsFormat>          labelsFormat
+%type <JSONExpressionParser>  jsonExpressionParser
+%type <JSONExpression>        jsonExpression
+%type <JSONExpressionList>    jsonExpressionList
 %type <UnwrapExpr>            unwrapExpr
-%type <UnitFilter>           unitFilter
+%type <UnitFilter>            unitFilter
+%type <OffsetExpr>            offsetExpr
 
 %token <bytes> BYTES
 %token <str>      IDENTIFIER STRING NUMBER
@@ -89,7 +99,8 @@ import (
 %token <val>      MATCHERS LABELS EQ RE NRE OPEN_BRACE CLOSE_BRACE OPEN_BRACKET CLOSE_BRACKET COMMA DOT PIPE_MATCH PIPE_EXACT
                   OPEN_PARENTHESIS CLOSE_PARENTHESIS BY WITHOUT COUNT_OVER_TIME RATE SUM AVG MAX MIN COUNT STDDEV STDVAR BOTTOMK TOPK
                   BYTES_OVER_TIME BYTES_RATE BOOL JSON REGEXP LOGFMT PIPE LINE_FMT LABEL_FMT UNWRAP AVG_OVER_TIME SUM_OVER_TIME MIN_OVER_TIME
-                  MAX_OVER_TIME STDVAR_OVER_TIME STDDEV_OVER_TIME QUANTILE_OVER_TIME DURATION_CONV DURATION_SECONDS_CONV
+                  MAX_OVER_TIME STDVAR_OVER_TIME STDDEV_OVER_TIME QUANTILE_OVER_TIME BYTES_CONV DURATION_CONV DURATION_SECONDS_CONV
+                  FIRST_OVER_TIME LAST_OVER_TIME ABSENT_OVER_TIME LABEL_REPLACE UNPACK OFFSET
 
 // Operators are listed with increasing precedence.
 %left <binOp> OR
@@ -101,7 +112,7 @@ import (
 
 %%
 
-root: expr { exprlex.(*lexer).expr = $1 };
+root: expr { exprlex.(*parser).expr = $1 };
 
 expr:
       logExpr                                      { $$ = $1 }
@@ -113,6 +124,7 @@ metricExpr:
     | vectorAggregationExpr                         { $$ = $1 }
     | binOpExpr                                     { $$ = $1 }
     | literalExpr                                   { $$ = $1 }
+    | labelReplaceExpr                              { $$ = $1 }
     | OPEN_PARENTHESIS metricExpr CLOSE_PARENTHESIS { $$ = $2 }
     ;
 
@@ -123,19 +135,31 @@ logExpr:
     ;
 
 logRangeExpr:
-      selector RANGE                                                             { $$ = newLogRange(newMatcherExpr($1), $2, nil) }
-    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE                          { $$ = newLogRange(newMatcherExpr($2), $4, nil) }
-    | selector RANGE unwrapExpr                                                  { $$ = newLogRange(newMatcherExpr($1), $2 , $3) }
-    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE unwrapExpr               { $$ = newLogRange(newMatcherExpr($2), $4 , $5) }
-    | selector unwrapExpr RANGE                                                  { $$ = newLogRange(newMatcherExpr($1), $3, $2 ) }
-    | OPEN_PARENTHESIS selector unwrapExpr CLOSE_PARENTHESIS RANGE               { $$ = newLogRange(newMatcherExpr($2), $5, $3 ) }
-    | selector pipelineExpr RANGE                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $3, nil ) }
-    | OPEN_PARENTHESIS selector pipelineExpr CLOSE_PARENTHESIS RANGE             { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $5, nil ) }
-    | selector pipelineExpr unwrapExpr RANGE                                     { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $4, $3) }
-    | OPEN_PARENTHESIS selector pipelineExpr unwrapExpr CLOSE_PARENTHESIS RANGE  { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $6, $4) }
-    | selector RANGE pipelineExpr                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $3), $2, nil) }
-    | selector RANGE pipelineExpr unwrapExpr                                     { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $3), $2, $4 ) }
-    | OPEN_PARENTHESIS logRangeExpr CLOSE_PARENTHESIS                            { $$ = $2 }
+      selector RANGE                                                                        { $$ = newLogRange(newMatcherExpr($1), $2, nil, nil ) }
+    | selector RANGE offsetExpr                                                             { $$ = newLogRange(newMatcherExpr($1), $2, nil, $3 ) }
+    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE                                     { $$ = newLogRange(newMatcherExpr($2), $4, nil, nil ) }
+    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE offsetExpr                          { $$ = newLogRange(newMatcherExpr($2), $4, nil, $5 ) }
+    | selector RANGE unwrapExpr                                                             { $$ = newLogRange(newMatcherExpr($1), $2, $3, nil ) }
+    | selector RANGE offsetExpr unwrapExpr                                                  { $$ = newLogRange(newMatcherExpr($1), $2, $4, $3 ) }
+    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE unwrapExpr                          { $$ = newLogRange(newMatcherExpr($2), $4, $5, nil ) }
+    | OPEN_PARENTHESIS selector CLOSE_PARENTHESIS RANGE offsetExpr unwrapExpr               { $$ = newLogRange(newMatcherExpr($2), $4, $6, $5 ) }
+    | selector unwrapExpr RANGE                                                             { $$ = newLogRange(newMatcherExpr($1), $3, $2, nil ) }
+    | selector unwrapExpr RANGE offsetExpr                                                  { $$ = newLogRange(newMatcherExpr($1), $3, $2, $4 ) }
+    | OPEN_PARENTHESIS selector unwrapExpr CLOSE_PARENTHESIS RANGE                          { $$ = newLogRange(newMatcherExpr($2), $5, $3, nil ) }
+    | OPEN_PARENTHESIS selector unwrapExpr CLOSE_PARENTHESIS RANGE offsetExpr               { $$ = newLogRange(newMatcherExpr($2), $5, $3, $6 ) }
+    | selector pipelineExpr RANGE                                                           { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $3, nil, nil ) }
+    | selector pipelineExpr RANGE offsetExpr                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $3, nil, $4 ) }
+    | OPEN_PARENTHESIS selector pipelineExpr CLOSE_PARENTHESIS RANGE                        { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $5, nil, nil ) }
+    | OPEN_PARENTHESIS selector pipelineExpr CLOSE_PARENTHESIS RANGE offsetExpr             { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $5, nil, $6 ) }
+    | selector pipelineExpr unwrapExpr RANGE                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $4, $3, nil ) }
+    | selector pipelineExpr unwrapExpr RANGE offsetExpr                                     { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $2), $4, $3, $5 ) }
+    | OPEN_PARENTHESIS selector pipelineExpr unwrapExpr CLOSE_PARENTHESIS RANGE             { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $6, $4, nil ) }
+    | OPEN_PARENTHESIS selector pipelineExpr unwrapExpr CLOSE_PARENTHESIS RANGE offsetExpr  { $$ = newLogRange(newPipelineExpr(newMatcherExpr($2), $3), $6, $4, $7 ) }
+    | selector RANGE pipelineExpr                                                           { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $3), $2, nil, nil) }
+    | selector RANGE offsetExpr pipelineExpr                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $4), $2, nil, $3 ) }
+    | selector RANGE pipelineExpr unwrapExpr                                                { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $3), $2, $4, nil ) }
+    | selector RANGE offsetExpr pipelineExpr unwrapExpr                                     { $$ = newLogRange(newPipelineExpr(newMatcherExpr($1), $4), $2, $5, $3 ) }
+    | OPEN_PARENTHESIS logRangeExpr CLOSE_PARENTHESIS                                       { $$ = $2 }
     | logRangeExpr error
     ;
 
@@ -146,7 +170,8 @@ unwrapExpr:
   ;
 
 convOp:
-    DURATION_CONV           { $$ = OpConvDuration }
+    BYTES_CONV              { $$ = OpConvBytes }
+  | DURATION_CONV           { $$ = OpConvDuration }
   | DURATION_SECONDS_CONV   { $$ = OpConvDurationSeconds }
   ;
 
@@ -165,6 +190,12 @@ vectorAggregationExpr:
     // Aggregations with 2 arguments.
     | vectorOp OPEN_PARENTHESIS NUMBER COMMA metricExpr CLOSE_PARENTHESIS                 { $$ = mustNewVectorAggregationExpr($5, $1, nil, &$3) }
     | vectorOp OPEN_PARENTHESIS NUMBER COMMA metricExpr CLOSE_PARENTHESIS grouping        { $$ = mustNewVectorAggregationExpr($5, $1, $7, &$3) }
+    | vectorOp grouping OPEN_PARENTHESIS NUMBER COMMA metricExpr CLOSE_PARENTHESIS        { $$ = mustNewVectorAggregationExpr($6, $1, $2, &$4) }
+    ;
+
+labelReplaceExpr:
+    LABEL_REPLACE OPEN_PARENTHESIS metricExpr COMMA STRING COMMA STRING COMMA STRING COMMA STRING CLOSE_PARENTHESIS
+      { $$ = mustNewLabelReplaceExpr($3, $5, $7, $9, $11)}
     ;
 
 filter:
@@ -200,6 +231,7 @@ pipelineExpr:
 pipelineStage:
    lineFilters                   { $$ = $1 }
   | PIPE labelParser             { $$ = $2 }
+  | PIPE jsonExpressionParser    { $$ = $2 }
   | PIPE labelFilter             { $$ = &labelFilterExpr{LabelFilterer: $2 }}
   | PIPE lineFormatExpr          { $$ = $2 }
   | PIPE labelFormatExpr         { $$ = $2 }
@@ -213,7 +245,11 @@ labelParser:
     JSON           { $$ = newLabelParserExpr(OpParserTypeJSON, "") }
   | LOGFMT         { $$ = newLabelParserExpr(OpParserTypeLogfmt, "") }
   | REGEXP STRING  { $$ = newLabelParserExpr(OpParserTypeRegexp, $2) }
+  | UNPACK         { $$ = newLabelParserExpr(OpParserTypeUnpack, "") }
   ;
+
+jsonExpressionParser:
+    JSON jsonExpressionList { $$ = newJSONExpressionParser($2) }
 
 lineFormatExpr: LINE_FMT STRING { $$ = newLineFmtExpr($2) };
 
@@ -240,6 +276,14 @@ labelFilter:
     | labelFilter COMMA labelFilter                  { $$ = log.NewAndLabelFilter($1, $3 ) }
     | labelFilter OR labelFilter                     { $$ = log.NewOrLabelFilter($1, $3 ) }
     ;
+
+jsonExpression:
+    IDENTIFIER EQ STRING { $$ = log.NewJSONExpr($1, $3) }
+
+jsonExpressionList:
+    jsonExpression                          { $$ = []log.JSONExpression{$1} }
+  | jsonExpressionList COMMA jsonExpression { $$ = append($1, $3) }
+  ;
 
 unitFilter:
       durationFilter { $$ = $1 }
@@ -330,8 +374,13 @@ rangeOp:
     | STDVAR_OVER_TIME   { $$ = OpRangeTypeStdvar }
     | STDDEV_OVER_TIME   { $$ = OpRangeTypeStddev }
     | QUANTILE_OVER_TIME { $$ = OpRangeTypeQuantile }
+    | FIRST_OVER_TIME    { $$ = OpRangeTypeFirst }
+    | LAST_OVER_TIME     { $$ = OpRangeTypeLast }
+    | ABSENT_OVER_TIME   { $$ = OpRangeTypeAbsent }
     ;
 
+offsetExpr:
+    OFFSET DURATION { $$ = newOffsetExpr( $2 ) }
 
 labels:
       IDENTIFIER                 { $$ = []string{ $1 } }
@@ -341,5 +390,7 @@ labels:
 grouping:
       BY OPEN_PARENTHESIS labels CLOSE_PARENTHESIS        { $$ = &grouping{ without: false , groups: $3 } }
     | WITHOUT OPEN_PARENTHESIS labels CLOSE_PARENTHESIS   { $$ = &grouping{ without: true , groups: $3 } }
+    | BY OPEN_PARENTHESIS CLOSE_PARENTHESIS               { $$ = &grouping{ without: false , groups: nil } }
+    | WITHOUT OPEN_PARENTHESIS CLOSE_PARENTHESIS          { $$ = &grouping{ without: true , groups: nil } }
     ;
 %%
